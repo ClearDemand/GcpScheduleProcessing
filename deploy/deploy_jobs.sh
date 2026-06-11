@@ -30,6 +30,97 @@ IMAGE="gcr.io/${PROJECT}/gcp-schedule-processing:latest"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# ----------------------------------------------------------------------------
+#  IAM bootstrap (idempotent). Creates the run/scheduler SAs if missing and
+#  grants every role the deploy + runtime need, so a brand-new environment is
+#  self-provisioning. Re-running is a no-op (add-iam-policy-binding is
+#  idempotent). Set SETUP_IAM=false to skip (e.g. if the deployer lacks IAM
+#  admin and an admin has already run this once).
+#
+#  The deploying identity must itself be allowed to create SAs and set IAM
+#  policies for this to succeed; failures are warned (not fatal) so a deploy by
+#  a limited deployer still proceeds against already-provisioned IAM.
+# ----------------------------------------------------------------------------
+# The identity that runs this deploy needs iam.serviceAccounts.actAs on the
+# run/scheduler SAs. Default to the active gcloud account (the GHA SA in CI,
+# your user locally); override with DEPLOYER=.
+DEPLOYER="${DEPLOYER:-$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -1)}"
+# IAM members are "serviceAccount:" for SAs, "user:" for human accounts.
+case "$DEPLOYER" in
+    *gserviceaccount.com) DEPLOYER_MEMBER="serviceAccount:${DEPLOYER}" ;;
+    *)                    DEPLOYER_MEMBER="user:${DEPLOYER}" ;;
+esac
+
+ensure_sa() {  # email, display-name
+    local SA="$1" NAME
+    NAME="${SA%%@*}"
+    if gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1; then
+        echo "    SA exists: $SA"
+    else
+        echo "    creating SA: $SA"
+        gcloud iam service-accounts create "$NAME" --project "$PROJECT" \
+            --display-name "$2" || echo "    WARNING: could not create $SA"
+    fi
+}
+
+grant() {  # human label, then the full gcloud command as remaining args
+    local LABEL="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+        echo "    granted: $LABEL"
+    else
+        echo "    WARNING: failed to grant $LABEL (deployer may lack IAM admin; grant manually)"
+    fi
+}
+
+provision_iam() {
+    echo "==> Ensuring service accounts + IAM (idempotent) for ${ENV} / ${PROJECT}"
+    echo "    deployer = ${DEPLOYER_MEMBER}"
+    ensure_sa "$RUN_SA"   "Cloud Run Jobs runtime SA (GcpScheduleProcessing)"
+    ensure_sa "$SCHED_SA" "Cloud Scheduler invoker SA (GcpScheduleProcessing)"
+
+    # Deployer must be able to actAs both SAs (sets --service-account /
+    # --oauth-service-account-email on the resources below).
+    for SA in "$RUN_SA" "$SCHED_SA"; do
+        grant "actAs $SA" \
+            gcloud iam service-accounts add-iam-policy-binding "$SA" \
+                --project "$PROJECT" --member="$DEPLOYER_MEMBER" \
+                --role="roles/iam.serviceAccountUser"
+    done
+
+    # Run SA: write to the destination bucket.
+    grant "storage.objectAdmin on gs://${GCS_BUCKET}" \
+        gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+            --member="serviceAccount:${RUN_SA}" --role="roles/storage.objectAdmin"
+
+    # Run SA: read every secret named in config/.env.<ENV>.json secretsManager.
+    local SECRET_NAMES
+    SECRET_NAMES="$(node -p "Object.values(require('./config/.env.${ENV}.json').secretsManager||{}).join('\n')")"
+    while IFS= read -r SECRET; do
+        [ -z "$SECRET" ] && continue
+        grant "secretAccessor on ${SECRET}" \
+            gcloud secrets add-iam-policy-binding "$SECRET" --project "$PROJECT" \
+                --member="serviceAccount:${RUN_SA}" --role="roles/secretmanager.secretAccessor"
+    done <<< "$SECRET_NAMES"
+
+    # Run SA: Firestore + Cloud SQL (no resource-scoped option for these).
+    grant "datastore.user (Firestore)" \
+        gcloud projects add-iam-policy-binding "$PROJECT" \
+            --member="serviceAccount:${RUN_SA}" --role="roles/datastore.user" --condition=None
+    grant "cloudsql.client (Cloud SQL)" \
+        gcloud projects add-iam-policy-binding "$PROJECT" \
+            --member="serviceAccount:${RUN_SA}" --role="roles/cloudsql.client" --condition=None
+
+    # Scheduler SA: invoke the Cloud Run Jobs it triggers.
+    grant "run.invoker (scheduler)" \
+        gcloud projects add-iam-policy-binding "$PROJECT" \
+            --member="serviceAccount:${SCHED_SA}" --role="roles/run.invoker" --condition=None
+}
+
+if [ "${SETUP_IAM:-true}" = "true" ]; then
+    provision_iam
+    echo ""
+fi
+
 echo "==> Building image ${IMAGE}"
 gcloud builds submit --project "$PROJECT" --tag "$IMAGE" .
 
