@@ -1,0 +1,76 @@
+name: Deploy
+
+# Deploys every job in jobs/registry.js as a Cloud Run Job + Cloud Scheduler
+# trigger. The target environment is selected from the pushed branch:
+#   develop -> dev, stage -> stage, main -> prod
+on:
+  push:
+    branches:
+      - main
+      - stage
+      - develop
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      REGION: us-central1
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Select environment
+        id: envselect
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "ENV=prod" >> $GITHUB_ENV
+          elif [ "${{ github.ref_name }}" = "stage" ]; then
+            echo "ENV=stage" >> $GITHUB_ENV
+          else
+            echo "ENV=dev" >> $GITHUB_ENV
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        env:
+          GCP_SA_KEY: ${{ github.ref_name == 'main' && secrets.GCP_SA_KEY_PROD || (github.ref_name == 'stage' && secrets.GCP_SA_KEY_STAGE || secrets.GCP_SA_KEY_DEV) }}
+        with:
+          credentials_json: "${{ env.GCP_SA_KEY }}"
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Resolve env vars from config/.env.${ENV}.json
+        run: |
+          # config/.env.<ENV>.json is the single source of truth for per-env
+          # values. Pull the ones deploy_jobs.sh needs into $GITHUB_ENV.
+          CFG="config/.env.${ENV}.json"
+          echo "GCP_PROJECT_ID=$(node -p "require('./${CFG}').GCP_PROJECT_ID")" >> $GITHUB_ENV
+          echo "GCS_BUCKET=$(node -p "require('./${CFG}').gcs_bucket")" >> $GITHUB_ENV
+          echo "FIRESTORE_DB=$(node -p "require('./${CFG}').FIRESTORE_DATABASE_ID")" >> $GITHUB_ENV
+          echo "DB_ENV=$(node -p "require('./${CFG}').dbENV")" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Syntax check (ESM)
+        run: npm run check
+
+      - name: Deploy jobs + schedulers
+        run: |
+          # PROJECT/REGION/ENV/GCS_BUCKET/DB_ENV/FIRESTORE_DB are already in the
+          # environment (set via $GITHUB_ENV in the steps above). deploy_jobs.sh
+          # reads PROJECT and GCS_BUCKET, so map GCP_PROJECT_ID -> PROJECT here.
+          export PROJECT="${GCP_PROJECT_ID}"
+          chmod +x deploy/deploy_jobs.sh
+          ./deploy/deploy_jobs.sh
+
+      - name: Done
+        run: echo "Deployment complete for ENV=${ENV} (project ${GCP_PROJECT_ID})"
