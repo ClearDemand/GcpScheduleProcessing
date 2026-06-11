@@ -151,7 +151,7 @@ async function exportMatchLibrary(companyKey) {
                     const { internalMatches, externalMatches } = cleanMatches(partitionMatches, competitorMap, tenantMappings, companyKey);
 
                     if (internalMatches && internalMatches.length > 0) {
-                        consolidateMatches(allInternalFilename, internalMatches);
+                        await consolidateMatches(allInternalFilename, internalMatches);
 
                         let internalFilename = `${baseName}${competitorBanners[c]}_matches_internal.csv`;
                         await createCsvFile(stagePath(internalFilename), internalMatches);
@@ -177,7 +177,7 @@ async function exportMatchLibrary(companyKey) {
 
                                     let segmentZipName = getZipSegmentFile(segment, 'internal');
                                     if (segmentZipName) {
-                                        consolidateMatches(segmentZipName['allFileName'], segmentMatches);
+                                        await consolidateMatches(segmentZipName['allFileName'], segmentMatches);
                                     }
                                 }
                             }
@@ -185,7 +185,7 @@ async function exportMatchLibrary(companyKey) {
                     }
 
                     if (externalMatches && externalMatches.length > 0) {
-                        consolidateMatches(allExternalFilename, externalMatches);
+                        await consolidateMatches(allExternalFilename, externalMatches);
 
                         let competitorName = competitorDisplayMap[competitorBanners[c]] || competitorBanners[c].split('_')[1];
                         let externalFilename = `${baseName}${competitorName}_matches.csv`;
@@ -211,7 +211,7 @@ async function exportMatchLibrary(companyKey) {
 
                                     let segmentZipName = getZipSegmentFile(segment, 'external');
                                     if (segmentZipName) {
-                                        consolidateMatches(segmentZipName['allFileName'], segmentMatches);
+                                        await consolidateMatches(segmentZipName['allFileName'], segmentMatches);
                                     }
                                 }
                             }
@@ -222,12 +222,16 @@ async function exportMatchLibrary(companyKey) {
         }
 
         try {
-            internalFiles.addLocalFile(stagePath(allInternalFilename));
-            await internalFiles.writeZipPromise(stagePath(internalZip));
-            await gcs.uploadObject({
-                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${internalZip}`,
-                Body: fs.readFileSync(stagePath(internalZip))
-            });
+            // Only present if this tenant produced internal matches; skip the
+            // zip otherwise (nothing to consolidate).
+            if (fs.existsSync(stagePath(allInternalFilename))) {
+                internalFiles.addLocalFile(stagePath(allInternalFilename));
+                await internalFiles.writeZipPromise(stagePath(internalZip));
+                await gcs.uploadObject({
+                    Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${internalZip}`,
+                    Body: fs.readFileSync(stagePath(internalZip))
+                });
+            }
         } catch (err) {
             console.error(`Failed to add file: ${stagePath(allInternalFilename)}`, err.message);
         }
@@ -236,13 +240,15 @@ async function exportMatchLibrary(companyKey) {
             for (let zipSegment of globalZip) {
                 if (zipSegment['type'] == 'internal') {
                     try {
-                        let segmentZip = new AdmZip();
-                        segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
-                        await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
-                        await gcs.uploadObject({
-                            Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${zipSegment['zipFileName']}`,
-                            Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
-                        });
+                        if (fs.existsSync(stagePath(zipSegment['allFileName']))) {
+                            let segmentZip = new AdmZip();
+                            segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
+                            await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
+                            await gcs.uploadObject({
+                                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${zipSegment['zipFileName']}`,
+                                Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
+                            });
+                        }
                     } catch (err) {
                         console.error(`Failed to add file: ${stagePath(zipSegment['allFileName'])}`, err.message);
                     }
@@ -250,12 +256,16 @@ async function exportMatchLibrary(companyKey) {
             }
         }
         try {
-            externalFiles.addLocalFile(stagePath(allExternalFilename));
-            await externalFiles.writeZipPromise(stagePath(externalZip));
-            await gcs.uploadObject({
-                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${externalZip}`,
-                Body: fs.readFileSync(stagePath(externalZip))
-            });
+            // Only present if this tenant produced external matches; skip the
+            // zip otherwise (nothing to consolidate).
+            if (fs.existsSync(stagePath(allExternalFilename))) {
+                externalFiles.addLocalFile(stagePath(allExternalFilename));
+                await externalFiles.writeZipPromise(stagePath(externalZip));
+                await gcs.uploadObject({
+                    Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${externalZip}`,
+                    Body: fs.readFileSync(stagePath(externalZip))
+                });
+            }
         } catch (err) {
             console.error(`Failed to add file: ${stagePath(allExternalFilename)}`, err.message);
         }
@@ -264,13 +274,15 @@ async function exportMatchLibrary(companyKey) {
             for (let zipSegment of globalZip) {
                 if (zipSegment['type'] == 'external') {
                     try {
-                        let segmentZip = new AdmZip();
-                        segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
-                        await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
-                        await gcs.uploadObject({
-                            Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${zipSegment['zipFileName']}`,
-                            Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
-                        });
+                        if (fs.existsSync(stagePath(zipSegment['allFileName']))) {
+                            let segmentZip = new AdmZip();
+                            segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
+                            await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
+                            await gcs.uploadObject({
+                                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${zipSegment['zipFileName']}`,
+                                Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
+                            });
+                        }
                     } catch (err) {
                         console.error(`Failed to add file: ${stagePath(zipSegment['allFileName'])}`, err.message);
                     }
@@ -514,26 +526,39 @@ function capitalizeFirstLetter(string) {
     }
 }
 
+// Appends `data` rows to the consolidated CSV at `fileName`. Returns a promise
+// that resolves only once the append has fully flushed to disk — callers must
+// await it, otherwise the later addLocalFile() can read a missing/truncated
+// file (and concurrent append streams to the same file can interleave).
 function consolidateMatches(fileName, data) {
-    try {
-        let writer;
-        let filePath = stagePath(fileName);
+    return new Promise((resolve) => {
+        try {
+            if (!data || data.length === 0) {
+                return resolve();
+            }
+            let writer;
+            let filePath = stagePath(fileName);
 
-        if (!fs.existsSync(filePath)) {
-            let headers = Object.keys(data[0]).map((v) => { return v; });
-            writer = csvWriteStream({ headers });
-        } else {
-            writer = csvWriteStream({ sendHeaders: false });
-        }
-        writer.pipe(fs.createWriteStream(filePath, { flags: 'a' }));
+            if (!fs.existsSync(filePath)) {
+                let headers = Object.keys(data[0]).map((v) => { return v; });
+                writer = csvWriteStream({ headers });
+            } else {
+                writer = csvWriteStream({ sendHeaders: false });
+            }
+            const out = fs.createWriteStream(filePath, { flags: 'a' });
+            out.on('finish', resolve);
+            out.on('error', (error) => { console.log(error); resolve(); });
+            writer.pipe(out);
 
-        for (let i = 0; i < data.length; i++) {
-            writer.write(data[i]);
+            for (let i = 0; i < data.length; i++) {
+                writer.write(data[i]);
+            }
+            writer.end();
+        } catch (error) {
+            console.log(error);
+            resolve();
         }
-        writer.end();
-    } catch (error) {
-        console.log(error);
-    }
+    });
 }
 
 function parseObject(inputObject) {

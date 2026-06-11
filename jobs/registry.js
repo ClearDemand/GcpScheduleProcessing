@@ -25,8 +25,8 @@ export default {
         timezone: 'Asia/Kolkata',
         timeout: '1800s',
         // Export loads matches → builds CSVs → ZIPs entirely in memory; 1Gi OOMs.
-        // 4Gi gives headroom and stays within the 1-vCPU limit (>4Gi needs ≥2 vCPU).
-        memory: '4Gi',
+        // 8Gi gives headroom and stays within the 1-vCPU limit (>8Gi needs ≥2 vCPU).
+        memory: '8Gi',
         env: {}
     }
 };
