@@ -20,7 +20,7 @@ import * as aurora from '../stdLib/aurora_resources.js';
 import * as retailscape from '../stdLib/retailscape_resources.js';
 import * as firestore from '../stdLib/firestore_resources.js';
 import * as gcs from '../stdLib/gcs_resources.js';
-import { createCsvFile, initExportFolder } from '../stdLib/node_utils.js';
+import { createCsvFile, initExportFolder, removeDirectory } from '../stdLib/node_utils.js';
 import {
     notifySlackProcessStart,
     notifySlackProcessCompleted,
@@ -70,14 +70,20 @@ let globalZip = [];
 //  Main
 // ------
 export async function run() {
-    await aurora.init();
-    await retailscape.init();
+    try {
+        await aurora.init();
+        await retailscape.init();
 
-    const clients = await firestore.getLibraryExportClients();
-    console.log(`${moment().format()} ${jobName} | ${clients.length} client(s) with match_library feature enabled in tenant_feature_v2 (ENV=${process.env.ENV || 'dev'})`);
+        const clients = await firestore.getLibraryExportClients();
+        console.log(`${moment().format()} ${jobName} | ${clients.length} client(s) with match_library feature enabled in tenant_feature_v2 (ENV=${process.env.ENV || 'dev'})`);
 
-    for (let i = 0; i < clients.length; i++) {
-        await exportMatchLibrary(clients[i]);
+        for (let i = 0; i < clients.length; i++) {
+            await exportMatchLibrary(clients[i]);
+        }
+    } finally {
+        // Post-job cleanup: drop the staging dir so the last tenant's CSVs/ZIPs
+        // don't linger in Cloud Run's RAM-backed temp dir after the job exits.
+        removeDirectory(EXPORT_DIR);
     }
 }
 
