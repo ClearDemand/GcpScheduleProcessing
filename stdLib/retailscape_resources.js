@@ -44,15 +44,18 @@ export async function init() {
     console.log(`RetailScape Postgres connected (search_path=${schema})`);
 }
 
-// tenant_code list for tenants with the match_library feature enabled.
-// Source of truth for which tenants the export runs for.
+// tenants with the match_library feature enabled, each with its per-tenant
+// export_config (from feature_config->'export_config'). Source of truth for
+// which tenants the export runs for.
 export async function getMatchLibraryTenants() {
     const query = `
-        SELECT tenant_code
+        SELECT tenant_code, feature_config->'export_config' as export_config
         FROM tenant_feature_v2
         WHERE lower(feature_name) = lower('match_library')
           AND is_enabled = true
     `;
     const res = await pool.query(query);
-    return res.rows.map(r => r.tenant_code).filter(Boolean);
+    return res.rows
+        .filter(r => r.tenant_code)
+        .map(r => ({ tenant_code: r.tenant_code, export_config: r.export_config }));
 }

@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node index.js",
     "match-library-gcs-export": "JOB_NAME=match-library-gcs-export node index.js",
-    "check": "node --check index.js && node --check jobs/registry.js && node --check jobs/match_library_gcs_export.js && node --check stdLib/env.js && node --check stdLib/secret_manager_resources.js && node --check stdLib/aurora_resources.js && node --check stdLib/retailscape_resources.js && node --check stdLib/firestore_resources.js && node --check stdLib/gcs_resources.js && node --check stdLib/node_utils.js && node --check stdLib/sendSlackNotification.js"
+    "catalog-sync": "JOB_NAME=catalog-sync node index.js",
+    "tpvr-metrics-ingestion": "JOB_NAME=tpvr-metrics-ingestion node index.js",
+    "check": "node --check index.js && node --check jobs/registry.js && node --check jobs/match_library_gcs_export.js && node --check jobs/catalog_sync.js && node --check jobs/tpvr_metrics_ingestion.js && node --check stdLib/env.js && node --check stdLib/secret_manager_resources.js && node --check stdLib/aurora_resources.js && node --check stdLib/retailscape_resources.js && node --check stdLib/firestore_resources.js && node --check stdLib/gcs_resources.js && node --check stdLib/node_utils.js && node --check stdLib/sendSlackNotification.js"
   },
   "engines": {
     "node": ">=18"

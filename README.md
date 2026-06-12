@@ -30,6 +30,47 @@ Connection conventions mirror `matchlibrary-baas`: Cloud SQL via a `pg` pool who
 from **GCP Secret Manager** (`secretsManager.pmtAurora`), `search_path = dbENV`; Firestore db
 `matchlibrary-baas`.
 
+## Job: `catalog-sync`
+
+A **port of `PmtScheduleProcessing/scripts/catalog_sync_processor.js`**. For each tenant with
+the `catalog_syncup_process` flag set in the Firestore company-code library, it brings the
+tenant's `matches_*` base attributes in sync with the latest catalog capture: per catalog
+column it finds matches whose `base_*` value differs from the catalog and updates them (with
+the company-code-specific extras for `bjs` UOM-normalization + UPC, `thrive` total_size, and
+`ctc` UPC resolution), records the synced `capture_date` in `catalog_version`, and uploads a
+CSV + summary report.
+
+| Data | AWS original | GCP port |
+|---|---|---|
+| Clients enabled for catalog sync | DynamoDB `CompanyCodeLibrary` (`catalog_syncup_process`) | **Firestore** (same flag) |
+| Matches / catalog / `catalog_version` / UOM tables | AWS Aurora | **Cloud SQL** (same tables) |
+| Updated-matches report | S3 `bungee.productmatching` | **GCS** bucket |
+
+The transform logic (`processSyncUp`, `processNormalizedAtrributes`, `processUpcFields`,
+`checkforSpecialConditions`, `upcCheckSum`, `resolveBaseUpcFromList`) is copied verbatim from
+the original; only the data-access layer (Aurora→Cloud SQL, DynamoDB→Firestore, S3→GCS) and
+the node-cron→Cloud Scheduler trigger changed. Report key layout:
+`catalog_sync_updated_matches/company_code=<cc>/year=/month=/day=/<file>`. Runs daily at
+**01:00 UTC** (the original cron time).
+
+## Job: `tpvr-metrics-ingestion`
+
+A **port of `PmtScheduleProcessing/scripts/tpvr_metrics_ingestion.js`**. For each tenant with
+`tpvr_level >= 1`, it inserts a `metrics_<cc>` row for every auto-completed match of the
+current day (matches verified with no human `tpvr_worker`/`tpvr_manager`), one `INSERT … SELECT`
+pass per enabled report type in the tenant's `reports_available`: `tpvr` → `<cc>-external`,
+`tpvr_manager` → `<cc>-manager`, `tpvr_upc` → `<cc>-upc`, `tpvr_equivalent` → `<cc>-equivalent`.
+
+| Data | AWS original | GCP port |
+|---|---|---|
+| Tenants (`tpvr_level`, `reports_available`) | DynamoDB `CompanyCodeLibrary` | **Firestore** (same fields) |
+| Matches / catalog / `metrics_<cc>` tables | AWS Aurora | **Cloud SQL** (same tables) |
+
+The ingestion SQL is copied verbatim from the original; only the connection layer (Aurora
+pool → `runQuery`) and tenant source (DynamoDB → Firestore) changed. Errors are isolated
+per-tenant (logged + Slacked, the loop continues). Runs daily at **23:00 UTC** (the original
+cron time).
+
 ## Layout
 
 ```
@@ -37,6 +78,8 @@ index.js                         # dispatcher: runs JOB_NAME, exits 0/1
 jobs/
   registry.js                    # every job: schedule, timeout, env, handler
   match_library_gcs_export.js    # the ported export job
+  catalog_sync.js                # the ported catalog-sync job
+  tpvr_metrics_ingestion.js      # the ported tpvr-metrics-ingestion job
 config/
   .env.local.json                # per-ENV config (mirrors matchlibrary-baas src/config)
   .env.dev.json
