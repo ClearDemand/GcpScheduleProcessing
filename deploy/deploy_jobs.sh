@@ -136,10 +136,22 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
     echo ""
     echo "==> Deploying Cloud Run Job: ${NAME}"
 
+    # Derive a Node heap cap from the container memory. V8 doesn't read the
+    # cgroup limit, so without --max-old-space-size it caps old-space at ~2GB and
+    # OOMs ("Ineffective mark-compacts near heap limit") well before the container
+    # limit. Use ~75% of the container, leaving headroom for off-heap Buffers
+    # (AdmZip ZIPs / readFileSync) and the runtime.
+    case "$MEMORY" in
+        *Gi) MEM_MB=$(( ${MEMORY%Gi} * 1024 )) ;;
+        *Mi) MEM_MB=${MEMORY%Mi} ;;
+        *)   MEM_MB=512 ;;
+    esac
+    HEAP_MB=$(( MEM_MB * 3 / 4 ))
+
     # Use ^@^ delimiter so commas inside secretsManager JSON aren't split.
     # secretsManager is intentionally omitted so the per-env config/.env.<ENV>.json
     # supplies it; append it only when SECRETS_MANAGER is set as an override.
-    ENV_VARS="^@^JOB_NAME=${NAME}@ENV=${ENV}@GCP_PROJECT_ID=${PROJECT}@FIRESTORE_DATABASE_ID=${FIRESTORE_DB}@dbENV=${DB_ENV}@gcs_bucket=${GCS_BUCKET}"
+    ENV_VARS="^@^JOB_NAME=${NAME}@ENV=${ENV}@GCP_PROJECT_ID=${PROJECT}@FIRESTORE_DATABASE_ID=${FIRESTORE_DB}@dbENV=${DB_ENV}@gcs_bucket=${GCS_BUCKET}@NODE_OPTIONS=--max-old-space-size=${HEAP_MB}"
     if [ -n "$SECRETS_MANAGER" ]; then
         ENV_VARS="${ENV_VARS}@secretsManager=${SECRETS_MANAGER}"
     fi
