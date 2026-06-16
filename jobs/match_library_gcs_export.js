@@ -372,7 +372,7 @@ function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
             externalData['uploaded_by'] = null;
         }
 
-        externalData[`base`] = data.base_source_store.split('_')[1];
+        externalData[`base`] = data?.base_source_store?.split('_')[1];
         externalData[`base_sku`] = `\t${data.base_sku}`;
         externalData[`base_upc`] = `\t${data.base_upc}`;
         externalData[`base_title`] = data.base_title;
