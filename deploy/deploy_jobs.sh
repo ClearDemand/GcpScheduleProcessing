@@ -18,6 +18,10 @@ set -euo pipefail
 
 PROJECT="${PROJECT:?set PROJECT (gcp project id)}"
 REGION="${REGION:-us-central1}"
+# Cloud Scheduler isn't available in every Cloud Run region (e.g. us-east5), so
+# the trigger location is decoupled from the job's REGION. A scheduler in any
+# supported region can invoke a Cloud Run Job in REGION via its OAuth HTTP call.
+SCHED_REGION="${SCHED_REGION:-us-central1}"
 ENV="${ENV:-dev}"
 GCS_BUCKET="${GCS_BUCKET:?set GCS_BUCKET (destination bucket)}"
 DB_ENV="${DB_ENV:-$ENV}"                            # Postgres search_path / schema
@@ -148,6 +152,11 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
     esac
     HEAP_MB=$(( MEM_MB * 3 / 4 ))
 
+    # Cloud Run requires >=2 vCPU for >4Gi of memory. Derive the minimum vCPU
+    # that satisfies the requested memory so a job can ask for 8Gi via registry
+    # without also having to hand-set CPU.
+    if [ "$MEM_MB" -gt 4096 ]; then CPU=2; else CPU=1; fi
+
     # Use ^@^ delimiter so commas inside secretsManager JSON aren't split.
     # secretsManager is intentionally omitted so the per-env config/.env.<ENV>.json
     # supplies it; append it only when SECRETS_MANAGER is set as an override.
@@ -161,6 +170,7 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
         --image "$IMAGE" \
         --task-timeout "$TIMEOUT" \
         --memory "$MEMORY" \
+        --cpu "$CPU" \
         --max-retries 2 \
         --service-account "$RUN_SA" \
         --set-env-vars "$ENV_VARS"
@@ -168,15 +178,15 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
     echo "==> Scheduling trigger: trigger-${NAME} (${SCHEDULE} ${TIMEZONE})"
     RUN_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${NAME}:run"
 
-    if gcloud scheduler jobs describe "trigger-${NAME}" --project "$PROJECT" --location "$REGION" >/dev/null 2>&1; then
+    if gcloud scheduler jobs describe "trigger-${NAME}" --project "$PROJECT" --location "$SCHED_REGION" >/dev/null 2>&1; then
         gcloud scheduler jobs update http "trigger-${NAME}" \
-            --project "$PROJECT" --location "$REGION" \
+            --project "$PROJECT" --location "$SCHED_REGION" \
             --schedule "$SCHEDULE" --time-zone "$TIMEZONE" \
             --uri "$RUN_URI" --http-method POST \
             --oauth-service-account-email "$SCHED_SA"
     else
         gcloud scheduler jobs create http "trigger-${NAME}" \
-            --project "$PROJECT" --location "$REGION" \
+            --project "$PROJECT" --location "$SCHED_REGION" \
             --schedule "$SCHEDULE" --time-zone "$TIMEZONE" \
             --uri "$RUN_URI" --http-method POST \
             --oauth-service-account-email "$SCHED_SA"
