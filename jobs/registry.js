@@ -25,9 +25,9 @@ export default {
         timezone: 'Asia/Kolkata',
         timeout: '1800s',
         // Export loads matches → builds CSVs → ZIPs entirely in memory; 1Gi OOMs.
-        // 4Gi is the max allowed at the default 1 vCPU (>4Gi needs ≥2 vCPU) and
-        // has run all tenants without OOM.
-        memory: '4Gi',
+        // 4Gi OOM-killed (SIGKILL) on a large tenant, so bump to 8Gi. >4Gi needs
+        // ≥2 vCPU, which deploy_jobs.sh derives automatically from this value.
+        memory: '8Gi',
         env: {}
     }
 };

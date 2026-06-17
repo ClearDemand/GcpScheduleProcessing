@@ -148,6 +148,11 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
     esac
     HEAP_MB=$(( MEM_MB * 3 / 4 ))
 
+    # Cloud Run requires >=2 vCPU for >4Gi of memory. Derive the minimum vCPU
+    # that satisfies the requested memory so a job can ask for 8Gi via registry
+    # without also having to hand-set CPU.
+    if [ "$MEM_MB" -gt 4096 ]; then CPU=2; else CPU=1; fi
+
     # Use ^@^ delimiter so commas inside secretsManager JSON aren't split.
     # secretsManager is intentionally omitted so the per-env config/.env.<ENV>.json
     # supplies it; append it only when SECRETS_MANAGER is set as an override.
@@ -161,6 +166,7 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
         --image "$IMAGE" \
         --task-timeout "$TIMEOUT" \
         --memory "$MEMORY" \
+        --cpu "$CPU" \
         --max-retries 2 \
         --service-account "$RUN_SA" \
         --set-env-vars "$ENV_VARS"
