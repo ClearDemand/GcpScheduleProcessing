@@ -19,9 +19,8 @@ export default {
     'match-library-gcs-export': {
         handlerPath: './jobs/match_library_gcs_export.js',
         // The S3 export (PmtScheduleProcessing) runs ~01:30 IST. Run after it so
-        // the day's files exist. 04:00 IST gives a comfortable buffer.
-        // Original AWS cron was 01:30 IST daily. Keep the same time.
-        schedule: '30 1 * * *',
+        // the day's files exist. 05:30 IST gives a comfortable buffer.
+        schedule: '30 5 * * *',
         timezone: 'Asia/Kolkata',
         timeout: '1800s',
         // Export loads matches → builds CSVs → ZIPs entirely in memory; 1Gi OOMs.
