@@ -57,6 +57,16 @@ jobs:
           echo "FIRESTORE_DB=$(node -p "require('./${CFG}').FIRESTORE_DATABASE_ID")" >> $GITHUB_ENV
           echo "DB_ENV=$(node -p "require('./${CFG}').dbENV")" >> $GITHUB_ENV
 
+      - name: Grant runtime SA write access to the GCS bucket
+        run: |
+          # The Cloud Run Jobs runtime SA (batch-jobs-sa) must be able to write
+          # match_library_export CSVs to the destination bucket. deploy_jobs.sh
+          # also grants this, but only as a best-effort warning; do it here too
+          # so the deploy fails loudly if the binding can't be applied.
+          gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+            --member="serviceAccount:batch-jobs-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+            --role="roles/storage.objectAdmin"
+
       - name: Install dependencies
         run: npm install
 
