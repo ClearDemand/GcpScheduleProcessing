@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      REGION: us-central1
+      REGION: us-east5
 
     steps:
       - name: Checkout source

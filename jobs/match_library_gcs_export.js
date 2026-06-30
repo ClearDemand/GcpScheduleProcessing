@@ -20,7 +20,7 @@ import * as aurora from '../stdLib/aurora_resources.js';
 import * as retailscape from '../stdLib/retailscape_resources.js';
 import * as firestore from '../stdLib/firestore_resources.js';
 import * as gcs from '../stdLib/gcs_resources.js';
-import { createCsvFile, initExportFolder } from '../stdLib/node_utils.js';
+import { createCsvFile, initExportFolder, removeDirectory } from '../stdLib/node_utils.js';
 import {
     notifySlackProcessStart,
     notifySlackProcessCompleted,
@@ -70,14 +70,20 @@ let globalZip = [];
 //  Main
 // ------
 export async function run() {
-    await aurora.init();
-    await retailscape.init();
+    try {
+        await aurora.init();
+        await retailscape.init();
 
-    const clients = await firestore.getLibraryExportClients();
-    console.log(`${moment().format()} ${jobName} | ${clients.length} client(s) with match_library feature enabled in tenant_feature_v2 (ENV=${process.env.ENV || 'dev'})`);
+        const clients = await firestore.getLibraryExportClients();
+        console.log(`${moment().format()} ${jobName} | ${clients.length} client(s) with match_library feature enabled in tenant_feature_v2 (ENV=${process.env.ENV || 'dev'})`);
 
-    for (let i = 0; i < clients.length; i++) {
-        await exportMatchLibrary(clients[i]);
+        for (let i = 0; i < clients.length; i++) {
+            await exportMatchLibrary(clients[i]);
+        }
+    } finally {
+        // Post-job cleanup: drop the staging dir so the last tenant's CSVs/ZIPs
+        // don't linger in Cloud Run's RAM-backed temp dir after the job exits.
+        removeDirectory(EXPORT_DIR);
     }
 }
 
@@ -92,6 +98,8 @@ async function exportMatchLibrary(companyKey) {
         if (!companyKey.base_banners || !companyKey.competitor_banners) {
             return;
         }
+
+        const export_config = companyKey.export_config || {};
 
         let tenantMappings = await aurora.getTenantMappings(companyCode);
         let baseBanners = companyKey.base_banners;
@@ -145,13 +153,13 @@ async function exportMatchLibrary(companyKey) {
             let baseName = `${baseBanners.length > 1 ? baseBanners[b].split('_')[1] : ''}`;
 
             for (let c = 0; c < competitorBanners.length; c++) {
-                partitionMatches = await aurora.getMatchesByPartition(companyCode, baseBanners[b], competitorBanners[c], exportColumns, maxCaptureDate);
+                partitionMatches = await aurora.getMatchesByPartition(companyCode, baseBanners[b], competitorBanners[c], exportColumns, maxCaptureDate, export_config?.additional_columns || []);
                 if (partitionMatches && partitionMatches.length > 0) {
                     matchCount += partitionMatches.length;
                     const { internalMatches, externalMatches } = cleanMatches(partitionMatches, competitorMap, tenantMappings, companyKey);
 
                     if (internalMatches && internalMatches.length > 0) {
-                        consolidateMatches(allInternalFilename, internalMatches);
+                        await consolidateMatches(allInternalFilename, internalMatches);
 
                         let internalFilename = `${baseName}${competitorBanners[c]}_matches_internal.csv`;
                         await createCsvFile(stagePath(internalFilename), internalMatches);
@@ -177,7 +185,7 @@ async function exportMatchLibrary(companyKey) {
 
                                     let segmentZipName = getZipSegmentFile(segment, 'internal');
                                     if (segmentZipName) {
-                                        consolidateMatches(segmentZipName['allFileName'], segmentMatches);
+                                        await consolidateMatches(segmentZipName['allFileName'], segmentMatches);
                                     }
                                 }
                             }
@@ -185,7 +193,7 @@ async function exportMatchLibrary(companyKey) {
                     }
 
                     if (externalMatches && externalMatches.length > 0) {
-                        consolidateMatches(allExternalFilename, externalMatches);
+                        await consolidateMatches(allExternalFilename, externalMatches);
 
                         let competitorName = competitorDisplayMap[competitorBanners[c]] || competitorBanners[c].split('_')[1];
                         let externalFilename = `${baseName}${competitorName}_matches.csv`;
@@ -211,7 +219,7 @@ async function exportMatchLibrary(companyKey) {
 
                                     let segmentZipName = getZipSegmentFile(segment, 'external');
                                     if (segmentZipName) {
-                                        consolidateMatches(segmentZipName['allFileName'], segmentMatches);
+                                        await consolidateMatches(segmentZipName['allFileName'], segmentMatches);
                                     }
                                 }
                             }
@@ -222,12 +230,16 @@ async function exportMatchLibrary(companyKey) {
         }
 
         try {
-            internalFiles.addLocalFile(stagePath(allInternalFilename));
-            await internalFiles.writeZipPromise(stagePath(internalZip));
-            await gcs.uploadObject({
-                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${internalZip}`,
-                Body: fs.readFileSync(stagePath(internalZip))
-            });
+            // Only present if this tenant produced internal matches; skip the
+            // zip otherwise (nothing to consolidate).
+            if (fs.existsSync(stagePath(allInternalFilename))) {
+                internalFiles.addLocalFile(stagePath(allInternalFilename));
+                await internalFiles.writeZipPromise(stagePath(internalZip));
+                await gcs.uploadObject({
+                    Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${internalZip}`,
+                    Body: fs.readFileSync(stagePath(internalZip))
+                });
+            }
         } catch (err) {
             console.error(`Failed to add file: ${stagePath(allInternalFilename)}`, err.message);
         }
@@ -236,13 +248,15 @@ async function exportMatchLibrary(companyKey) {
             for (let zipSegment of globalZip) {
                 if (zipSegment['type'] == 'internal') {
                     try {
-                        let segmentZip = new AdmZip();
-                        segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
-                        await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
-                        await gcs.uploadObject({
-                            Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${zipSegment['zipFileName']}`,
-                            Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
-                        });
+                        if (fs.existsSync(stagePath(zipSegment['allFileName']))) {
+                            let segmentZip = new AdmZip();
+                            segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
+                            await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
+                            await gcs.uploadObject({
+                                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/internal/${zipSegment['zipFileName']}`,
+                                Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
+                            });
+                        }
                     } catch (err) {
                         console.error(`Failed to add file: ${stagePath(zipSegment['allFileName'])}`, err.message);
                     }
@@ -250,12 +264,16 @@ async function exportMatchLibrary(companyKey) {
             }
         }
         try {
-            externalFiles.addLocalFile(stagePath(allExternalFilename));
-            await externalFiles.writeZipPromise(stagePath(externalZip));
-            await gcs.uploadObject({
-                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${externalZip}`,
-                Body: fs.readFileSync(stagePath(externalZip))
-            });
+            // Only present if this tenant produced external matches; skip the
+            // zip otherwise (nothing to consolidate).
+            if (fs.existsSync(stagePath(allExternalFilename))) {
+                externalFiles.addLocalFile(stagePath(allExternalFilename));
+                await externalFiles.writeZipPromise(stagePath(externalZip));
+                await gcs.uploadObject({
+                    Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${externalZip}`,
+                    Body: fs.readFileSync(stagePath(externalZip))
+                });
+            }
         } catch (err) {
             console.error(`Failed to add file: ${stagePath(allExternalFilename)}`, err.message);
         }
@@ -264,13 +282,15 @@ async function exportMatchLibrary(companyKey) {
             for (let zipSegment of globalZip) {
                 if (zipSegment['type'] == 'external') {
                     try {
-                        let segmentZip = new AdmZip();
-                        segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
-                        await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
-                        await gcs.uploadObject({
-                            Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${zipSegment['zipFileName']}`,
-                            Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
-                        });
+                        if (fs.existsSync(stagePath(zipSegment['allFileName']))) {
+                            let segmentZip = new AdmZip();
+                            segmentZip.addLocalFile(stagePath(zipSegment['allFileName']));
+                            await segmentZip.writeZipPromise(stagePath(zipSegment['zipFileName']));
+                            await gcs.uploadObject({
+                                Key: `match_library_export/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/external/${zipSegment['zipFileName']}`,
+                                Body: fs.readFileSync(stagePath(zipSegment['zipFileName']))
+                            });
+                        }
                     } catch (err) {
                         console.error(`Failed to add file: ${stagePath(zipSegment['allFileName'])}`, err.message);
                     }
@@ -303,42 +323,28 @@ function cleanMatches(matches, competitorMap, tenantMappings, companyKey) {
                 match.match_date = moment(match.manager_verified_date ?? match.customer_verified_date ?? moment.unix(match.match_date)).format('YYYY/MM/DD HH:mm');
                 match.client_sku_first_seen_date = moment.unix(match.client_sku_first_seen_date).format('YYYY/MM/DD HH:mm');
                 match.match_reason = fetchMatchReason(companyKey.equivalent_mappings, match.match_reason);
-                if (match.company_code == 'chewy') {
+                // Flatten custom-attribute JSON columns onto the match. Which
+                // keys to pull is config-driven via export_config.custom_attributes
+                // (base_keys / comp_keys), replacing the old per-company hardcode.
+                const customAttrs = (companyKey.export_config || {}).custom_attributes;
+                if (customAttrs) {
                     let base_custom = parseObject(match.base_custom_attributes);
                     let comp_custom = parseObject(match.comp_custom_attributes);
                     delete match.base_custom_attributes;
                     delete match.comp_custom_attributes;
-                    match.base_strength_concentration = base_custom && base_custom.base_strength_concentration ? base_custom.base_strength_concentration : null;
-                    match.base_strength_concentration_uom = base_custom && base_custom.base_strength_concentration_uom ? base_custom.base_strength_concentration_uom : null;
-                    match.comp_strength_concentration = comp_custom && comp_custom.comp_strength_concentration ? comp_custom.comp_strength_concentration : null;
-                    match.comp_strength_concentration_uom = comp_custom && comp_custom.comp_strength_concentration_uom ? comp_custom.comp_strength_concentration_uom : null;
-                    match.base_product_total_size = base_custom && base_custom.base_product_total_size ? base_custom.base_product_total_size : null;
-                    match.base_product_total_uom = base_custom && base_custom.base_product_total_uom ? base_custom.base_product_total_uom : null;
-                    match.comp_product_total_size = comp_custom && comp_custom.comp_product_total_size ? comp_custom.comp_product_total_size : null;
-                    match.comp_product_total_uom = comp_custom && comp_custom.comp_product_total_uom ? comp_custom.comp_product_total_uom : null;
-                    match.base_pharmacy_package_quantity = base_custom && base_custom.base_pharmacy_package_quantity ? base_custom.base_pharmacy_package_quantity : null;
-                    match.base_pharmacy_package_quantity_uom = base_custom && base_custom.base_pharmacy_package_quantity_uom ? base_custom.base_pharmacy_package_quantity_uom : null;
-                    match.comp_pharmacy_package_quantity = comp_custom && comp_custom.comp_pharmacy_package_quantity ? comp_custom.comp_pharmacy_package_quantity : null;
-                    match.comp_pharmacy_package_quantity_uom = comp_custom && comp_custom.comp_pharmacy_package_quantity ? comp_custom.comp_pharmacy_package_quantity : null;
-                    match.base_total_quantity = base_custom && base_custom.base_total_quantity ? base_custom.base_total_quantity : null;
-                    match.base_total_quantity_uom = base_custom && base_custom.base_total_quantity_uom ? base_custom.base_total_quantity_uom : null;
-                    match.comp_total_quantity = comp_custom && comp_custom.comp_total_quantity ? comp_custom.comp_total_quantity : null;
-                    match.comp_total_quantity_uom = comp_custom && comp_custom.comp_total_quantity_uom ? comp_custom.comp_total_quantity_uom : null;
-                    match.comp_converted_quantity = comp_custom && comp_custom.comp_converted_quantity ? comp_custom.comp_converted_quantity : null;
-                    match.comp_converted_quantity_uom_normalized = comp_custom && comp_custom.comp_converted_quantity_uom_normalized ? comp_custom.comp_converted_quantity_uom_normalized : null;
+                    for (let key of (customAttrs.base_keys || [])) {
+                        match[key] = base_custom && base_custom[key] ? base_custom[key] : null;
+                    }
+                    for (let key of (customAttrs.comp_keys || [])) {
+                        match[key] = comp_custom && comp_custom[key] ? comp_custom[key] : null;
+                    }
                 }
 
                 let internalData = { ...match };
                 internalMatches.push(internalData);
 
                 let externalData = cleanForExternalData(match, competitorMap, tenantMappings, companyKey);
-                if (companyKey.company_code == 'ctc') {
-                    if (match.active == true) {
-                        externalMatches.push(externalData);
-                    }
-                } else {
-                    externalMatches.push(externalData);
-                }
+                externalMatches.push(externalData);
             }
         }
 
@@ -351,6 +357,7 @@ function cleanMatches(matches, competitorMap, tenantMappings, companyKey) {
 
 function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
     try {
+        const export_config = companyKey.export_config || {};
         let externalData = {};
         externalData[`active`] = data.active;
         externalData[`match_date`] = data.match_date;
@@ -365,12 +372,9 @@ function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
             externalData['uploaded_by'] = null;
         }
 
-        externalData[`base`] = data.base_source_store.split('_')[1];
+        externalData[`base`] = data?.base_source_store?.split('_')[1];
         externalData[`base_sku`] = `\t${data.base_sku}`;
         externalData[`base_upc`] = `\t${data.base_upc}`;
-        if (companyKey.company_code == 'ctc') {
-            externalData['Style ID'] = data.base_parent_sku;
-        }
         externalData[`base_title`] = data.base_title;
         externalData[`base_url`] = data.base_url;
         externalData[`base_size`] = data.base_size;
@@ -380,20 +384,16 @@ function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
         }
         externalData['base_pack_size'] = data.base_pack_size;
         externalData['base_total_size'] = data.base_total_size;
-        if (companyKey.company_code == 'ctc') {
-            externalData['base_reg_price'] = data.base_price;
-            externalData['base_promo_price'] = data.base_promo_price;
-        }
 
         externalData[`base_${tenantMappings.category}`] = data.base_category;
         externalData[`base_${tenantMappings.subcategory}`] = data.base_subcategory;
         externalData[`base_${tenantMappings.sub_subcategory}`] = data.base_sub_subcategory;
-        if (companyKey.company_code == 'ctc') {
+        if (export_config.extended_category_enabled) {
             externalData[`base_${tenantMappings.sub_sub_subcategory}`] = data.base_sub_sub_subcategory;
             externalData[`base_${tenantMappings.sub_sub_sub_subcategory}`] = data.base_sub_sub_sub_subcategory;
         }
         externalData[`competitor`] = (competitorMap[data.comp_source_store] || {})['client_specific_store_name'] || data.comp_source_store.split('_')[1];
-        if (['wholefoods', 'wfuk', 'wfca'].includes(data.company_code)) {
+        if (export_config.competitor_name_enabled) {
             const storeMap = buildStoreMap(companyKey);
             externalData[`competitor_name`] = storeMap[data.comp_source_store] || (competitorMap[data.comp_source_store] || {})['display'] || data.comp_source_store.split('_')[1];
         }
@@ -414,10 +414,6 @@ function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
             externalData['normalized_comp_size'] = data.normalized_comp_size;
             externalData['normalized_comp_total_size'] = data.normalized_comp_total_size;
         }
-        if (companyKey.company_code == 'ctc') {
-            externalData['comp_reg_price'] = data.comp_reg_price;
-            externalData['comp_promo_price'] = data.comp_promo_price;
-        }
         externalData[`comp_${tenantMappings.category}`] = data.comp_category;
         externalData[`comp_${tenantMappings.subcategory}`] = data.comp_subcategory;
         externalData[`comp_${tenantMappings.sub_subcategory}`] = data.comp_sub_subcategory;
@@ -433,7 +429,7 @@ function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
         } else {
             externalData[`customer_review_state`] = data.customer_review_state;
         }
-        if (['wholefoods', 'wfuk', 'wfca'].includes(data.company_code)) {
+        if (export_config.reference_review_state_enabled) {
             if (data.customer_review_state == 'customer_verified') {
                 externalData[`customer_review_state`] = externalData[`match_type`] === 'reference' ? 'Worker Verified Reference' : 'Worker Verified';
                 if (data.customer_verified_date) {
@@ -446,7 +442,7 @@ function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
                 }
             }
         }
-        if (companyKey.verification_queue_enabled && !['wholefoods', 'wfuk', 'wfca'].includes(data.company_code)) {
+        if (companyKey.verification_queue_enabled && !export_config.reference_review_state_enabled) {
             externalData[`customer_verified_date`] = null;
             externalData[`manager_verified_date`] = null;
             if (data.customer_review_state == 'unverified') {
@@ -464,35 +460,16 @@ function cleanForExternalData(data, competitorMap, tenantMappings, companyKey) {
                 }
             }
         }
-        if (data.company_code == 'ctc') {
-            externalData['size_coefficient'] = data.size_coefficient;
-            externalData['quality_coefficient'] = data.quality_coefficient;
-            externalData['size_quality_coefficient_reason'] = data.size_quality_coefficient_reason;
-        }
         if (companyKey.tpvr_comment_enabled) {
             externalData['tpvr_comment'] = data.tpvr_rejection_comment;
         }
-        if (data.company_code == 'chewy') {
-            externalData[`base_strength`] = data.base_strength_concentration;
-            externalData[`base_strength_uom`] = data.base_strength_concentration_uom;
-            externalData[`comp_strength`] = data.comp_strength_concentration;
-            externalData[`comp_strength_uom`] = data.comp_strength_concentration_uom;
-            externalData[`base_product_total_size`] = data.base_product_total_size;
-            externalData[`base_product_total_uom`] = data.base_product_total_uom;
-            externalData[`comp_product_total_size`] = data.comp_product_total_size;
-            externalData[`comp_product_total_uom`] = data.comp_product_total_uom;
-            externalData[`base_quantity`] = data.base_pharmacy_package_quantity;
-            externalData[`base_quantity_uom`] = data.base_pharmacy_package_quantity_uom;
-            externalData[`comp_quantity`] = data.comp_pharmacy_package_quantity;
-            externalData[`comp_quantity_uom`] = data.comp_pharmacy_package_quantity_uom;
-            externalData[`base_total_quantity`] = data.base_total_quantity;
-            externalData[`base_total_quantity_uom`] = data.base_total_quantity_uom;
-            externalData[`comp_total_quantity`] = data.comp_total_quantity;
-            externalData[`comp_total_quantity_uom`] = data.comp_total_quantity_uom;
-            externalData[`base_normalized_size`] = data.base_size;
-            externalData[`base_normalized_uom`] = data.base_uom;
-            externalData[`comp_normalized_size`] = data.comp_converted_quantity;
-            externalData[`comp_normalized_uom`] = data.comp_converted_quantity_uom_normalized;
+        // Generic config-driven columns: a plain { outputColumn: sourceField }
+        // map in export_config.external_columns. Each output column is written
+        // from data[sourceField] (data is the already-flattened match row, so
+        // custom-attribute fields extracted in cleanMatches are available here
+        // too). Insertion order of the map keys controls CSV column order.
+        for (const [column, field] of Object.entries(export_config.external_columns || {})) {
+            externalData[column] = data[field];
         }
 
         return externalData;
@@ -514,26 +491,39 @@ function capitalizeFirstLetter(string) {
     }
 }
 
+// Appends `data` rows to the consolidated CSV at `fileName`. Returns a promise
+// that resolves only once the append has fully flushed to disk — callers must
+// await it, otherwise the later addLocalFile() can read a missing/truncated
+// file (and concurrent append streams to the same file can interleave).
 function consolidateMatches(fileName, data) {
-    try {
-        let writer;
-        let filePath = stagePath(fileName);
+    return new Promise((resolve) => {
+        try {
+            if (!data || data.length === 0) {
+                return resolve();
+            }
+            let writer;
+            let filePath = stagePath(fileName);
 
-        if (!fs.existsSync(filePath)) {
-            let headers = Object.keys(data[0]).map((v) => { return v; });
-            writer = csvWriteStream({ headers });
-        } else {
-            writer = csvWriteStream({ sendHeaders: false });
-        }
-        writer.pipe(fs.createWriteStream(filePath, { flags: 'a' }));
+            if (!fs.existsSync(filePath)) {
+                let headers = Object.keys(data[0]).map((v) => { return v; });
+                writer = csvWriteStream({ headers });
+            } else {
+                writer = csvWriteStream({ sendHeaders: false });
+            }
+            const out = fs.createWriteStream(filePath, { flags: 'a' });
+            out.on('finish', resolve);
+            out.on('error', (error) => { console.log(error); resolve(); });
+            writer.pipe(out);
 
-        for (let i = 0; i < data.length; i++) {
-            writer.write(data[i]);
+            for (let i = 0; i < data.length; i++) {
+                writer.write(data[i]);
+            }
+            writer.end();
+        } catch (error) {
+            console.log(error);
+            resolve();
         }
-        writer.end();
-    } catch (error) {
-        console.log(error);
-    }
+    });
 }
 
 function parseObject(inputObject) {

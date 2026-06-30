@@ -30,6 +30,47 @@ Connection conventions mirror `matchlibrary-baas`: Cloud SQL via a `pg` pool who
 from **GCP Secret Manager** (`secretsManager.pmtAurora`), `search_path = dbENV`; Firestore db
 `matchlibrary-baas`.
 
+## Job: `catalog-sync`
+
+A **port of `PmtScheduleProcessing/scripts/catalog_sync_processor.js`**. For each tenant with
+the `catalog_syncup_process` flag set in the Firestore company-code library, it brings the
+tenant's `matches_*` base attributes in sync with the latest catalog capture: per catalog
+column it finds matches whose `base_*` value differs from the catalog and updates them (with
+the company-code-specific extras for `bjs` UOM-normalization + UPC, `thrive` total_size, and
+`ctc` UPC resolution), records the synced `capture_date` in `catalog_version`, and uploads a
+CSV + summary report.
+
+| Data | AWS original | GCP port |
+|---|---|---|
+| Clients enabled for catalog sync | DynamoDB `CompanyCodeLibrary` (`catalog_syncup_process`) | **Firestore** (same flag) |
+| Matches / catalog / `catalog_version` / UOM tables | AWS Aurora | **Cloud SQL** (same tables) |
+| Updated-matches report | S3 `bungee.productmatching` | **GCS** bucket |
+
+The transform logic (`processSyncUp`, `processNormalizedAtrributes`, `processUpcFields`,
+`checkforSpecialConditions`, `upcCheckSum`, `resolveBaseUpcFromList`) is copied verbatim from
+the original; only the data-access layer (Aurora→Cloud SQL, DynamoDB→Firestore, S3→GCS) and
+the node-cron→Cloud Scheduler trigger changed. Report key layout:
+`catalog_sync_updated_matches/company_code=<cc>/year=/month=/day=/<file>`. Runs daily at
+**01:00 UTC** (the original cron time).
+
+## Job: `tpvr-metrics-ingestion`
+
+A **port of `PmtScheduleProcessing/scripts/tpvr_metrics_ingestion.js`**. For each tenant with
+`tpvr_level >= 1`, it inserts a `metrics_<cc>` row for every auto-completed match of the
+current day (matches verified with no human `tpvr_worker`/`tpvr_manager`), one `INSERT … SELECT`
+pass per enabled report type in the tenant's `reports_available`: `tpvr` → `<cc>-external`,
+`tpvr_manager` → `<cc>-manager`, `tpvr_upc` → `<cc>-upc`, `tpvr_equivalent` → `<cc>-equivalent`.
+
+| Data | AWS original | GCP port |
+|---|---|---|
+| Tenants (`tpvr_level`, `reports_available`) | DynamoDB `CompanyCodeLibrary` | **Firestore** (same fields) |
+| Matches / catalog / `metrics_<cc>` tables | AWS Aurora | **Cloud SQL** (same tables) |
+
+The ingestion SQL is copied verbatim from the original; only the connection layer (Aurora
+pool → `runQuery`) and tenant source (DynamoDB → Firestore) changed. Errors are isolated
+per-tenant (logged + Slacked, the loop continues). Runs daily at **23:00 UTC** (the original
+cron time).
+
 ## Layout
 
 ```
@@ -37,6 +78,8 @@ index.js                         # dispatcher: runs JOB_NAME, exits 0/1
 jobs/
   registry.js                    # every job: schedule, timeout, env, handler
   match_library_gcs_export.js    # the ported export job
+  catalog_sync.js                # the ported catalog-sync job
+  tpvr_metrics_ingestion.js      # the ported tpvr-metrics-ingestion job
 config/
   .env.local.json                # per-ENV config (mirrors matchlibrary-baas src/config)
   .env.dev.json
@@ -110,15 +153,34 @@ SECRETS_MANAGER='{"pmtAurora":"pmt-aurora-secret"}' \
 ./deploy/deploy_jobs.sh
 ```
 
-### Prerequisites (one-time)
-- A destination GCS bucket.
-- Service accounts:
-  - **run SA** (`RUN_SA`) — attached to the jobs; needs `roles/storage.objectAdmin` on the
-    GCS bucket, `roles/secretmanager.secretAccessor` on the Cloud SQL secret, `roles/datastore.user`
-    (Firestore read), and network access to Cloud SQL.
-  - **scheduler SA** (`SCHED_SA`) — `roles/run.invoker`.
-  - **deploy SA** (`GCP_DEPLOY_SA`) — Cloud Build, Cloud Run, Cloud Scheduler admin.
-- Cloud SQL connection secret in Secret Manager (JSON `{ "aurora": { host, username, password, database, port } }`).
+### IAM is provisioned by the deploy itself
+`deploy_jobs.sh` runs an **idempotent IAM bootstrap** before building (unless
+`SETUP_IAM=false`). It creates the run/scheduler SAs if missing and grants every role the
+deploy and runtime need, so a brand-new environment is self-provisioning and re-running is a
+no-op. Specifically it ensures:
+
+- **run SA** (`RUN_SA`, default `batch-jobs-sa@<project>`) — `roles/storage.objectAdmin` on
+  `GCS_BUCKET`, `roles/secretmanager.secretAccessor` on **every** secret named in
+  `config/.env.<ENV>.json` → `secretsManager`, `roles/datastore.user` (Firestore), and
+  `roles/cloudsql.client` (Cloud SQL).
+- **scheduler SA** (`SCHED_SA`, default `scheduler-sa@<project>`) — `roles/run.invoker`.
+- **deployer** (the active gcloud identity, or `DEPLOYER=`) — `roles/iam.serviceAccountUser`
+  (`iam.serviceAccounts.actAs`) on **both** SAs. Required because the deploy sets
+  `--service-account` / `--oauth-service-account-email` on the job and trigger; without it the
+  deploy fails with `Permission 'iam.serviceaccounts.actAs' denied on service account …`.
+  Note the basic `Editor`/`Owner` project roles do **not** reliably grant `actAs` — this is
+  why it's granted explicitly on each SA.
+
+The **deploying identity must itself have IAM-admin rights** (create SAs, set IAM policies) the
+first time, or the bootstrap will log `WARNING: failed to grant …` and continue. If your CI
+deployer is locked down, have an admin run the deploy once (or `SETUP_IAM`-only) with elevated
+credentials, then set `SETUP_IAM=false` for routine deploys.
+
+Still required out-of-band (not created by the bootstrap):
+- A destination **GCS bucket** (`GCS_BUCKET`).
+- The **Cloud SQL connection secret(s)** in Secret Manager (JSON
+  `{ "aurora": { host, username, password, database, port } }`).
+- The deployer's own **Cloud Build / Cloud Run / Cloud Scheduler admin** roles.
 
 ## Add another job
 

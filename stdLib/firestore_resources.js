@@ -38,12 +38,29 @@ export async function getAllCompanyCodes() {
 // RetailScape corresponds to company_code in Firestore.
 // NOTE: retailscape_resources.init() must have run before this is called.
 export async function getLibraryExportClients() {
-    const tenantCodes = await getMatchLibraryTenants();
-    if (tenantCodes.length === 0) return [];
+    const tenants = await getMatchLibraryTenants();
+    if (tenants.length === 0) return [];
 
-    const wanted = new Set(tenantCodes);
+    // tenant_code -> export_config, so the per-tenant export_config from
+    // RetailScape can be merged onto the matching Firestore doc.
+    const exportConfigByCode = new Map(tenants.map(t => [t.tenant_code, t.export_config]));
     const all = await getAllCompanyCodes();
-    return all.filter(c => wanted.has(c.company_code));
+    return all
+        .filter(c => exportConfigByCode.has(c.company_code))
+        .map(c => ({ ...c, export_config: exportConfigByCode.get(c.company_code) }));
+}
+
+// Tenants with the catalog sync-up feature enabled. Ported from
+// PmtScheduleProcessing tpvr_resources.getClientsEnabledForCatalogSyncProcess:
+// filter the company-code library on the `catalog_syncup_process` flag.
+export async function getClientsEnabledForCatalogSyncProcess() {
+    try {
+        const allClients = await getAllCompanyCodes();
+        return allClients.filter(client => !!client.catalog_syncup_process);
+    } catch (error) {
+        console.log(`getClientsEnabledForCatalogSyncProcess error: ${error.message}`);
+        return [];
+    }
 }
 
 // Competitor store mapping for a tenant, shaped like the old `domains` rows:
