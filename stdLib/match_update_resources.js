@@ -198,6 +198,7 @@ export async function syncRecords(data, keysToUpdate, companyKey) {
             return data;
         } else if (dqIssue === 'error') {
             data.processed.modified = false;
+            data.processed.isError = true;
             data.processed.status = 'Error in Processing Updation of GPC Data';
             return data;
         } else if (dqIssue === 'none') {
@@ -299,7 +300,7 @@ export async function syncRecords(data, keysToUpdate, companyKey) {
         return data;
     } catch (error) {
         console.log(`syncRecords error for match_id=${data?.match_id}: ${error.message}`);
-        data.processed = { modified: false, status: `Error: ${error.message}` };
+        data.processed = { modified: false, isError: true, status: `Error: ${error.message}` };
         data.updated = data.updated || {};
         return data;
     }
@@ -453,6 +454,7 @@ export async function syncPricingParquetRecords(data, keysToUpdate, companyKey, 
             return data;
         } else if (dqIssue === 'error') {
             data.processed.modified = false;
+            data.processed.isError = true;
             data.processed.status = 'Error in Processing Pricing Parquet Data';
             return data;
         } else if (dqIssue === 'none') {
@@ -569,7 +571,7 @@ export async function syncPricingParquetRecords(data, keysToUpdate, companyKey, 
         return data;
     } catch (error) {
         console.log(`syncPricingParquetRecords error for match_id=${data?.match_id}: ${error.message}`);
-        data.processed = { modified: false, status: `Error: ${error.message}` };
+        data.processed = { modified: false, isError: true, status: `Error: ${error.message}` };
         data.updated = data.updated || {};
         return data;
     }

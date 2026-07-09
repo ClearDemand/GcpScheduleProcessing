@@ -197,7 +197,7 @@ async function processBatch(companyKey, batchMatches, processId, keysToUpdate, u
         if (updateLevel !== 'competitor') {
             const updates = output.map(obj => ({
                 id: obj.id,
-                status: obj.processed?.modified ? 'completed' : 'failed',
+                status: obj.processed?.isError ? 'failed' : 'completed',
                 statusComments: obj.processed?.status
             }));
             await matchUpdate.updatePendingListingStatuses(companyKey.company_code, updates);
