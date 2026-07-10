@@ -10,6 +10,7 @@
 // ----------------------------------------------------------------------------
 import pkg from 'pg';
 import moment from 'moment';
+import { randomUUID } from 'crypto';
 import { getSecretAsJson } from './secret_manager_resources.js';
 
 const { Pool } = pkg;
@@ -74,7 +75,7 @@ export async function getMatchesByPartition(company_code, base_source_store, com
         const res = await pool.query(query);
         return res.rows;
     } catch (err) {
-        console.log(`getMatchesByPartition err for matches_${company_code}_${base_source_store}_${comp_source_store}: ${err.message}`);
+        console.log(`getMatchesByPartition err for matches_${company_code}_${base_source_store}: ${err.message}`);
         return [];
     }
 }
@@ -211,22 +212,10 @@ export async function insertToCatalogVersion(company_code, capture_date) {
     }
 }
 
-// Child (competitor) partitions of a matches base partition.
-export async function getCompPartitions(match_base_partition) {
-    try {
-        const query = `SELECT relname AS partition_name FROM pg_inherits JOIN pg_class ON pg_inherits.inhrelid = pg_class.oid WHERE pg_inherits.inhparent = '${match_base_partition}'::regclass;`;
-        const rows = await runQuery(query);
-        return rows || false;
-    } catch (error) {
-        console.log(`getCompPartitions err: ${error.message}`);
-        return false;
-    }
-}
-
 // Updates matches whose base attribute differs from the latest catalog value,
 // returning the affected rows. Mirrors the AWS implementation verbatim except
 // for the connection style.
-export async function updateMatchWithCatalog(matches_base_comp_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code, totalSizeToBeUpdated = false) {
+export async function updateMatchWithCatalog(matches_base_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code, totalSizeToBeUpdated = false) {
     try {
         const current_time = new Date().toISOString();
         const baseMatchesColumn = baseMatchesColumnFor(catalogColumn);
@@ -268,7 +257,7 @@ export async function updateMatchWithCatalog(matches_base_comp_partition, catalo
                 ${company_code == 'staterbros' ? ` AND cat.is_active` : ''}
                 and ${catalogNullCheckExpr}
         )
-        UPDATE ${matches_base_comp_partition} mss
+        UPDATE ${matches_base_partition} mss
         SET ${baseMatchesColumn} = res.${catalogColumn}
         ${catalogColumn == 'upc' ? standardizedBaseUpcCondition : ''}
         ${totalSizeCondition}
@@ -292,7 +281,7 @@ export async function updateMatchWithCatalog(matches_base_comp_partition, catalo
 
 // Returns matches whose base attribute differs from the latest catalog value
 // (the discrepancy report rows), without mutating anything.
-export async function fetchMatchDifferentWithCatalog(matches_base_comp_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code) {
+export async function fetchMatchDifferentWithCatalog(matches_base_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code) {
     try {
         const baseMatchesColumn = baseMatchesColumnFor(catalogColumn);
 
@@ -350,7 +339,7 @@ export async function fetchMatchDifferentWithCatalog(matches_base_comp_partition
             mss.model_used,
             '${baseMatchesColumn} is not matching' as update_reason,
             res.${catalogColumn} as updated_value
-            FROM ${matches_base_comp_partition} mss
+            FROM ${matches_base_partition} mss
             INNER JOIN filtered_catalog res ON mss.base_sku = res.sku
             WHERE
             mss.company_code = '${company_code}'
@@ -501,5 +490,81 @@ export async function updateAttributes(updates, companyCode) {
     } catch (error) {
         console.error(`updateAttributes err: ${error.message}`);
         return [];
+    }
+}
+
+// ============================================================================
+//  Match Update Processor resources — ported from PmtScheduleProcessing
+//  poll.js / aurora_resources.js. Used by jobs/match_update_processor.js.
+// ============================================================================
+
+// Single-row, dynamic-column update for one match — used instead of
+// updateNormalizedAttributes/updateAttributes above, which union columns
+// across a whole batch and would null out any column a given row doesn't set.
+// Different matches in the same sync batch change different subsets of the
+// ~20 possible comp_* keys, so each match needs its own SET clause.
+export async function updateMatchAttributes(companyCode, baseSourceStore, compSourceStore, matchId, modifyValues) {
+    const cols = Object.keys(modifyValues);
+    if (cols.length === 0) return null;
+
+    const setClause = cols.map((c, i) => `${c} = $${i + 2}`).join(', ');
+    const table = `matches_${companyCode}_${baseSourceStore}`;
+    const rows = await runQuery(
+        `UPDATE ${table} SET ${setClause} WHERE match_id = $1 RETURNING *`,
+        [matchId, ...cols.map(c => modifyValues[c])]
+    );
+    return rows[0] || null;
+}
+
+// Brand-type lookup for a competitor brand, from brand_master. Ported from
+// PmtScheduleProcessing aurora_resources.getCompBrandType.
+export async function getCompBrandType(sourceStore, brand) {
+    try {
+        const rows = await runQuery(
+            `SELECT brand_type FROM brand_master WHERE lower(source_store) = lower($1) AND lower(brand) = lower($2)`,
+            [sourceStore, brand]
+        );
+        return (rows && rows[0]) ? rows[0].brand_type : false;
+    } catch (error) {
+        console.log(`getCompBrandType err: ${error.message}`);
+        return false;
+    }
+}
+
+// Bulk audit-trail insert into matches_audit_trail. Ported from
+// PmtScheduleProcessing aurora_resources.insertIntoAuditRecords — old code
+// used pg-promise's ColumnSet/insert helper and the `uuid4` npm package for
+// audit_id; this uses Node's built-in crypto.randomUUID() (no new dependency)
+// and a manually-built parameterized multi-row INSERT (avoiding the old
+// code's manual quote-escaping entirely).
+export async function insertIntoAuditRecords(companyCode, auditRows, reason, updateAction, updatedBy = 'gcp-scheduler', source = 'gcp-scheduler') {
+    if (!auditRows || auditRows.length === 0) return null;
+
+    const columns = ['audit_id', 'company_code', 'match_id', 'updated_by', 'updated_timestamp',
+        'updated_reason', 'update_action', 'old_value', 'new_value', 'base_sku', 'comp_sku', 'comp_source_store', 'source'];
+
+    const valueRows = [];
+    const values = [];
+    for (const row of auditRows) {
+        const rowValues = [
+            randomUUID(), companyCode, row.match_id ?? null, updatedBy, new Date().toISOString(),
+            reason, updateAction,
+            row.prev_value ? JSON.stringify(row.prev_value) : null,
+            row.new_value ? JSON.stringify(row.new_value) : null,
+            row.base_sku ?? null, row.comp_sku ?? null, row.comp_source_store ?? null, source
+        ];
+        const placeholders = rowValues.map((_, i) => `$${values.length + i + 1}`);
+        valueRows.push(`(${placeholders.join(', ')})`);
+        values.push(...rowValues);
+    }
+
+    try {
+        return await runQuery(
+            `INSERT INTO matches_audit_trail (${columns.join(', ')}) VALUES ${valueRows.join(', ')}`,
+            values
+        );
+    } catch (error) {
+        console.log(`insertIntoAuditRecords err: ${error.message}`);
+        return null;
     }
 }

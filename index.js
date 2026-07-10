@@ -32,6 +32,4 @@ async function main() {
     }
 }
 
-process.env.JOB_NAME = 'match-library-gcs-export'
-
 main();
