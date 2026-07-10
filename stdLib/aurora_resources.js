@@ -75,7 +75,7 @@ export async function getMatchesByPartition(company_code, base_source_store, com
         const res = await pool.query(query);
         return res.rows;
     } catch (err) {
-        console.log(`getMatchesByPartition err for matches_${company_code}_${base_source_store}_${comp_source_store}: ${err.message}`);
+        console.log(`getMatchesByPartition err for matches_${company_code}_${base_source_store}: ${err.message}`);
         return [];
     }
 }
@@ -212,22 +212,10 @@ export async function insertToCatalogVersion(company_code, capture_date) {
     }
 }
 
-// Child (competitor) partitions of a matches base partition.
-export async function getCompPartitions(match_base_partition) {
-    try {
-        const query = `SELECT relname AS partition_name FROM pg_inherits JOIN pg_class ON pg_inherits.inhrelid = pg_class.oid WHERE pg_inherits.inhparent = '${match_base_partition}'::regclass;`;
-        const rows = await runQuery(query);
-        return rows || false;
-    } catch (error) {
-        console.log(`getCompPartitions err: ${error.message}`);
-        return false;
-    }
-}
-
 // Updates matches whose base attribute differs from the latest catalog value,
 // returning the affected rows. Mirrors the AWS implementation verbatim except
 // for the connection style.
-export async function updateMatchWithCatalog(matches_base_comp_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code, totalSizeToBeUpdated = false) {
+export async function updateMatchWithCatalog(matches_base_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code, totalSizeToBeUpdated = false) {
     try {
         const current_time = new Date().toISOString();
         const baseMatchesColumn = baseMatchesColumnFor(catalogColumn);
@@ -269,7 +257,7 @@ export async function updateMatchWithCatalog(matches_base_comp_partition, catalo
                 ${company_code == 'staterbros' ? ` AND cat.is_active` : ''}
                 and ${catalogNullCheckExpr}
         )
-        UPDATE ${matches_base_comp_partition} mss
+        UPDATE ${matches_base_partition} mss
         SET ${baseMatchesColumn} = res.${catalogColumn}
         ${catalogColumn == 'upc' ? standardizedBaseUpcCondition : ''}
         ${totalSizeCondition}
@@ -293,7 +281,7 @@ export async function updateMatchWithCatalog(matches_base_comp_partition, catalo
 
 // Returns matches whose base attribute differs from the latest catalog value
 // (the discrepancy report rows), without mutating anything.
-export async function fetchMatchDifferentWithCatalog(matches_base_comp_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code) {
+export async function fetchMatchDifferentWithCatalog(matches_base_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code) {
     try {
         const baseMatchesColumn = baseMatchesColumnFor(catalogColumn);
 
@@ -351,7 +339,7 @@ export async function fetchMatchDifferentWithCatalog(matches_base_comp_partition
             mss.model_used,
             '${baseMatchesColumn} is not matching' as update_reason,
             res.${catalogColumn} as updated_value
-            FROM ${matches_base_comp_partition} mss
+            FROM ${matches_base_partition} mss
             INNER JOIN filtered_catalog res ON mss.base_sku = res.sku
             WHERE
             mss.company_code = '${company_code}'
@@ -520,7 +508,7 @@ export async function updateMatchAttributes(companyCode, baseSourceStore, compSo
     if (cols.length === 0) return null;
 
     const setClause = cols.map((c, i) => `${c} = $${i + 2}`).join(', ');
-    const table = `matches_${companyCode}_${baseSourceStore}_${compSourceStore}`;
+    const table = `matches_${companyCode}_${baseSourceStore}`;
     const rows = await runQuery(
         `UPDATE ${table} SET ${setClause} WHERE match_id = $1 RETURNING *`,
         [matchId, ...cols.map(c => modifyValues[c])]

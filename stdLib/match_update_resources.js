@@ -98,9 +98,10 @@ export async function updatePendingListingStatuses(companyCode, updates) {
 //  Match lookups
 // ------------------------
 
-// Matches for a company/base/competitor partition, optionally filtered by
-// active status or a match_date window. Ported from the old same-named
-// function, parameterized instead of raw string interpolation.
+// Matches for a company/base partition filtered by comp_source_store,
+// optionally further filtered by active status or a match_date window.
+// Ported from the old same-named function, parameterized instead of raw
+// string interpolation.
 export async function getAllCompetitorMatches(companyCode, baseSourceStore, compSourceStore, active, inactiveOnly, startDate, endDate) {
     try {
         const table = `matches_${companyCode}_${baseSourceStore}`;
