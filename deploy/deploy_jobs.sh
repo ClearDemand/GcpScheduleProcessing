@@ -185,6 +185,8 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
         --cpu "$CPU" \
         --max-retries 2 \
         --service-account "$RUN_SA" \
+        --vpc-connector retailscape-vpc-connector \
+        --vpc-egress private-ranges-only \
         --set-env-vars "$ENV_VARS"
 
     if [ -n "$SCHEDULE" ]; then
