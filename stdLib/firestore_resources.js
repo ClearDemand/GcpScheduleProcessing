@@ -63,6 +63,80 @@ export async function getClientsEnabledForCatalogSyncProcess() {
     }
 }
 
+// Shared catalog attribute mapping for the catalog sync job: the declarative
+// catalog-column -> base_* column specs, one doc for all tenants (per-tenant
+// behaviour is expressed via `enabled_by_flag` references to flags on the
+// company-code docs). Provisioned by scripts/provision_catalog_attribute_mapping.js.
+export async function getCatalogAttributeMapping() {
+    try {
+        const collectionName = process.env.catalog_sync_config_collection || 'catalog_sync_config';
+        const snapshot = await firestore.collection(collectionName).doc('attribute_mapping').get();
+        if (!snapshot.exists) return null;
+        return snapshot.data().catalog_attribute_mapping || null;
+    } catch (error) {
+        console.log(`getCatalogAttributeMapping error: ${error.message}`);
+        return null;
+    }
+}
+
+// Full company-code doc for a tenant. Mirrors matchlibrary-baas
+// MatchesDao.getTenantInfo.
+export async function getTenantInfo(tenant_code) {
+    const snapshot = await firestore
+        .collection(process.env.company_code_collection)
+        .where('company_code', '==', tenant_code)
+        .get();
+
+    if (snapshot.empty) return null;
+    return snapshot.docs[0].data();
+}
+
+// Active competitor banners for a tenant. Ported from matchlibrary-baas
+// MatchesDao.getTenantCompetitors verbatim, error handling adjusted to this
+// module's convention (log + safe fallback instead of throwing).
+export async function getTenantCompetitors(tenant_code, filters, responseKeys) {
+    try {
+        const result = await getTenantInfo(tenant_code);
+
+        let competitors = result.competitor_banners;
+
+        // Filter for is_banner_inactive: false
+        competitors = competitors.filter((banner) => {
+            return banner.is_banner_inactive === false;
+        });
+
+        // Apply filters dynamically
+        if (filters && Object.keys(filters).length > 0) {
+            competitors = competitors.filter((banner) => {
+                return Object.entries(filters).every(([key, value]) => {
+                    return banner[key] === value;
+                });
+            });
+        }
+
+        // Map to responseKeys if provided
+        if (responseKeys && responseKeys.length > 0) {
+            competitors = competitors.map((banner) => {
+                const mappedBanner = {};
+                responseKeys.forEach((key) => {
+                    if (banner.hasOwnProperty(key)) {
+                        mappedBanner[key] = banner[key];
+                    }
+                });
+                return mappedBanner;
+            });
+        } else {
+            // Return only display_name if no responseKeys provided
+            competitors = competitors.map((banner) => banner.display_name);
+        }
+
+        return competitors;
+    } catch (error) {
+        console.log(`getTenantCompetitors err: ${error.message}`);
+        return [];
+    }
+}
+
 // Competitor store mapping for a tenant, shaped like the old `domains` rows:
 //   [{ source_store, client_specific_store_name, display }]
 export async function getDomainsForClient(companyCode) {

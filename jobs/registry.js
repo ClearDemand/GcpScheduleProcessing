@@ -28,5 +28,14 @@ export default {
         // ≥2 vCPU, which deploy_jobs.sh derives automatically from this value.
         memory: '8Gi',
         env: {}
+    },
+    'catalog-sync': {
+        handlerPath: './jobs/catalog_sync.js',
+        // Everyday at 06:30 IST (= 01:00 UTC), matching the PmtScheduleProcessing
+        schedule: '30 6 * * *',
+        timezone: 'Asia/Kolkata',
+        timeout: '3600s',
+        memory: '4Gi',
+        env: {}
     }
 };
