@@ -209,15 +209,25 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
     fi
 
     # Trigger-only jobs need an external caller authorized to invoke *this*
-    # job specifically. MATCH_UPDATE_INVOKER_SA is unset by default (safe: the
-    # job just stays uninvokable by anyone but existing job-runner principals)
-    # until the calling service's account email is known.
-    if [ "$NAME" = "match-update-processor" ] && [ -n "${MATCH_UPDATE_INVOKER_SA:-}" ]; then
-        grant "run.invoker (${MATCH_UPDATE_INVOKER_SA}) on ${NAME}" \
-            gcloud run jobs add-iam-policy-binding "$NAME" \
-                --project "$PROJECT" --region "$REGION" \
-                --member="serviceAccount:${MATCH_UPDATE_INVOKER_SA}" --role="roles/run.invoker"
-    fi
+    # job specifically. match-update-processor and
+    # auto-ingestion-processor are both invoked by the same caller
+    # (matchlibrary-baas's Cloud Function runtime SA), so they share one
+    # invoker-SA variable. MATCHLIBRARY_BAAS_INVOKER_SA is unset by default
+    # (safe: the job just stays uninvokable by anyone but existing job-runner
+    # principals) until the calling service's account email is known.
+    # MATCH_UPDATE_INVOKER_SA is accepted as a fallback for anyone who already
+    # has it set from before auto-ingestion-processor existed.
+    INVOKER_SA="${MATCHLIBRARY_BAAS_INVOKER_SA:-${MATCH_UPDATE_INVOKER_SA:-}}"
+    case "$NAME" in
+        match-update-processor|auto-ingestion-processor)
+            if [ -n "$INVOKER_SA" ]; then
+                grant "run.invoker (${INVOKER_SA}) on ${NAME}" \
+                    gcloud run jobs add-iam-policy-binding "$NAME" \
+                        --project "$PROJECT" --region "$REGION" \
+                        --member="serviceAccount:${INVOKER_SA}" --role="roles/run.invoker"
+            fi
+            ;;
+    esac
 done <<< "$JOBS"
 
 echo ""
