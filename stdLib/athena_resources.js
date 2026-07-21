@@ -96,7 +96,7 @@ const UPC_MATCHES_DB = 'ml_stack_prod_matches';
 export async function getUpcMatchesToProcess(companyCode, loadDate) {
     try {
         return await runAthenaQuery(
-            `SELECT * FROM ${UPC_MATCHES_DB}.auto_approval_matches
+            `SELECT * FROM pmt.auto_approval_matches
              WHERE company_code = '${escapeSql(companyCode)}'
              AND model_used != 'automation-reactivated-matches'
              AND load_date = '${escapeSql(loadDate)}'`,
