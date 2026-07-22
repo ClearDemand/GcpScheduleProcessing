@@ -12,6 +12,7 @@ import pkg from 'pg';
 import moment from 'moment';
 import { randomUUID } from 'crypto';
 import { getSecretAsJson } from './secret_manager_resources.js';
+import { DEFAULT_CATALOG_ATTRIBUTE_MAPPING } from './catalog_attribute_mapping.js';
 
 const { Pool } = pkg;
 
@@ -126,28 +127,139 @@ export async function getTenantMappings(tenantCode) {
 //  same convention getMatchesByPartition above relies on.
 // ============================================================================
 
-// JSON-backed catalog columns that are not top-level columns in the catalog
-// table. Structure: { company_code: { catalogColumn: { selectExpr, nullCheckExpr } } }
-const CATALOG_JSON_COLUMNS = {
-    ctc: {
-        sub_sub_sub_subcategory: {
-            selectExpr:    `cat.additional_attributes::json->>'sub_sub_sub_subcategory' as sub_sub_sub_subcategory`,
-            nullCheckExpr: `cat.additional_attributes::json->>'sub_sub_sub_subcategory' is not null and cat.additional_attributes::json->>'sub_sub_sub_subcategory' != ''`
-        }
+// Column names + types for a table, from information_schema (resolved within the
+// dbENV schema so it matches what the pool's search_path uses).
+export async function getSchema(table) {
+    try {
+        const rows = await runQuery(
+            `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 AND table_schema = $2`,
+            [table, process.env.dbENV]
+        );
+        return rows || [];
+    } catch (error) {
+        console.log(`getSchema err for ${table}: ${error.message}`);
+        return [];
     }
-};
+}
 
-// Resolves the matches base column that a given catalog column maps to.
-function baseMatchesColumnFor(catalogColumn) {
-    switch (catalogColumn) {
-        case 'product_url':         return 'base_url';
-        case 'image_url':           return 'base_img';
-        case 'brand_type':          return 'base_brandtype';
-        case 'product_title':       return 'base_title';
-        case 'product_description': return 'base_description';
-        case 'segment':             return 'segment';
-        case 'list_price':          return 'base_price';
-        default:                    return 'base_' + catalogColumn;
+// ============================================================================
+//  Catalog-sync plan — driven by DEFAULT_CATALOG_ATTRIBUTE_MAPPING
+//  (stdLib/catalog_attribute_mapping.js), overridable per tenant via
+//  `catalog_attribute_mapping_overrides` on the company-code doc. Replaces the
+//  previous hardcoded catalog-column -> base_* switch, the CATALOG_JSON_COLUMNS
+//  const and the exclusion-list schema discovery: the mapping is now the
+//  single authority on WHICH base_* columns sync and HOW their value is
+//  derived. buildCatalogSyncPlan() compiles the entries that apply to a tenant
+//  + target table into the SQL fragments fetch/updateMatchWithCatalog consume.
+// ============================================================================
+
+// information_schema data_types treated as numeric for diff comparisons —
+// replaces the old hardcoded `catalogColumn === 'list_price'` special case.
+const NUMERIC_DATA_TYPES = new Set(['numeric', 'integer', 'bigint', 'smallint', 'double precision', 'real', 'money']);
+
+// Ingestion-time transforms with no sync-time meaning (the sync only copies
+// catalog values onto existing matches; it never builds new rows).
+const SYNC_UNSUPPORTED_TRANSFORMS = new Set(['json_to_string', 'json_extract_base_upc', 'prefix']);
+
+// Drops mapping entries whose `enabled_by_flag` is off on this tenant's company-code doc.
+function resolveMappingEntry(entry, client) {
+    if (entry.enabled_by_flag && !client[entry.enabled_by_flag]) return null;
+    return entry;
+}
+
+// Compiles one mapping entry into the SQL fragments the sync queries need, or
+// null when it can't sync from this tenant's catalog table (no source column,
+// ingestion-only transform, or the only source is the sku join key).
+function buildColumnSpec(target, entry, catalogTypes) {
+    if (entry.transform === 'json_extract') {
+        if (!catalogTypes.has(entry.source)) return null;
+        // Safely extract from JSON: validate format first (starts with { or [), return NULL on invalid JSON
+        const jsonExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' AND (cat.${entry.source} LIKE '{%' OR cat.${entry.source} LIKE '[%') THEN COALESCE(cat.${entry.source}::jsonb->>'${entry.key}', NULL) ELSE NULL END`;
+        return {
+            target,
+            valueExpr: jsonExpr,
+            nullCheckExpr: `${jsonExpr} IS NOT NULL AND ${jsonExpr} != ''`,
+            isNumeric: false
+        };
+    }
+
+    if (entry.transform === 'text_to_jsonb') {
+        if (!catalogTypes.has(entry.source)) return null;
+        const jsonbExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' THEN cat.${entry.source}::jsonb ELSE NULL END`;
+        return {
+            target,
+            valueExpr: jsonbExpr,
+            nullCheckExpr: `${jsonbExpr} IS NOT NULL`,
+            isNumeric: false
+        };
+    }
+
+    if (entry.transform && entry.transform !== 'first_token') {
+        const reason = SYNC_UNSUPPORTED_TRANSFORMS.has(entry.transform) ? 'ingestion-only' : 'unknown';
+        console.log(`buildColumnSpec: ${target} uses ${reason} transform '${entry.transform}' - skipped`);
+        return null;
+    }
+
+    // sku is the join key (mss.base_sku = res.sku), so syncing from it is a
+    // no-op; only sources that exist on this tenant's catalog table count.
+    const sources = (entry.sources || [entry.source])
+        .filter(col => col && col !== 'sku' && catalogTypes.has(col));
+    if (!sources.length) return null;
+
+    const isNumeric = sources.every(col => NUMERIC_DATA_TYPES.has(catalogTypes.get(col)));
+    const multiSource = sources.length > 1;
+    const exprs = sources.map(col => {
+        const numericCol = NUMERIC_DATA_TYPES.has(catalogTypes.get(col));
+        let expr = `cat.${col}`;
+        if (numericCol && !isNumeric) expr = `(${expr})::text`;
+        // inside a coalesce chain '' must become NULL so the next source gets a chance
+        if (!numericCol && multiSource) expr = `NULLIF(${expr}, '')`;
+        if (entry.transform === 'first_token') expr = `split_part(${expr}, ' ', 1)`;
+        return expr;
+    });
+    const valueExpr = multiSource ? `COALESCE(${exprs.join(', ')})` : exprs[0];
+
+    return { target, valueExpr, isNumeric };
+}
+
+// Compiles the effective mapping into the per-column sync plan for one tenant
+// and target table (matches_<cc>_<cc>_<cc> or tpvr_<cc>): only entries whose
+// target column exists on the table and whose flags are on for this client.
+// The effective mapping is DEFAULT_CATALOG_ATTRIBUTE_MAPPING with any
+// per-tenant `catalog_attribute_mapping_overrides` on the company-code doc
+// merged on top, column by column (an override entry replaces the default
+// entry for that column wholesale; columns without an override keep the
+// default). Most tenants have no overrides and just get the default.
+//   client - the tenant's company-code doc (source of the behaviour flags and
+//            any catalog_attribute_mapping_overrides)
+export async function buildCatalogSyncPlan(catalogTable, targetTable, client) {
+    try {
+        const mapping = { ...DEFAULT_CATALOG_ATTRIBUTE_MAPPING, ...(client.catalog_attribute_mapping_overrides || {}) };
+
+        const catalogTypes = new Map((await getSchema(catalogTable)).map(r => [r.column_name, r.data_type]));
+        const targetCols = new Set((await getSchema(targetTable)).map(r => r.column_name));
+
+        // base_total_size = size * pack_size rides along on whichever of these
+        // two columns' own UPDATE pass runs (see recompute_total_size in the
+        // mapping doc) — only when this tenant's catalog has both source
+        // columns and the target table has base_total_size to write into.
+        const canRecomputeTotalSize = catalogTypes.has('size') && catalogTypes.has('pack_size') && targetCols.has('base_total_size');
+
+        const plan = [];
+        for (const [target, rawEntry] of Object.entries(mapping)) {
+            const entry = resolveMappingEntry(rawEntry, client);
+            if (!entry || !targetCols.has(target)) continue;
+
+            const spec = buildColumnSpec(target, entry, catalogTypes);
+            if (!spec) continue;
+
+            if (entry.recompute_total_size && canRecomputeTotalSize) spec.recomputeTotalSize = true;
+            plan.push(spec);
+        }
+        return plan;
+    } catch (error) {
+        console.log(`buildCatalogSyncPlan err (${catalogTable} -> ${targetTable}): ${error.message}`);
+        return [];
     }
 }
 
@@ -213,53 +325,54 @@ export async function insertToCatalogVersion(company_code, capture_date) {
 }
 
 // Updates matches whose base attribute differs from the latest catalog value,
-// returning the affected rows. Mirrors the AWS implementation verbatim except
-// for the connection style.
-export async function updateMatchWithCatalog(matches_base_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code, totalSizeToBeUpdated = false) {
+// returning the affected rows. `spec` is one buildCatalogSyncPlan() entry —
+// the mapping doc decides the value expression; this only assembles the query.
+export async function updateMatchWithCatalog(targetTable, catalog_base_partition, maxCatalogDate, spec, company_code, options = {}) {
     try {
+        const {
+            catalogActiveOnly = false  // only sync from catalog rows where is_active (was: staterbros)
+        } = options;
+
         const current_time = new Date().toISOString();
-        const baseMatchesColumn = baseMatchesColumnFor(catalogColumn);
 
+        // multiply-variant base_total_size recompute rides along on the
+        // base_size / base_pack_size updates (see buildCatalogSyncPlan).
         let totalSizeCondition = '';
-        if (totalSizeToBeUpdated) {
-            totalSizeCondition = ` ,base_total_size=(res.pack_size::numeric) * (res.size::numeric)`;
-        }
-        let standardizedBaseUpcCondition = '';
-        if (company_code == 'bjs') {
-            standardizedBaseUpcCondition = ` ,standardized_base_upc=res.additional_attributes::json->>'base_converted_upc'`;
+        let companionSelect = '';
+        if (spec.recomputeTotalSize) {
+            if (spec.target === 'base_pack_size') {
+                companionSelect = ', cat.size';
+                totalSizeCondition = ` ,base_total_size=(res.sync_value::numeric) * (res.size::numeric)`;
+            } else if (spec.target === 'base_size') {
+                companionSelect = `, split_part(cat.pack_size, ' ', 1 ) as pack_size`;
+                totalSizeCondition = ` ,base_total_size=(res.pack_size::numeric) * (res.sync_value::numeric)`;
+            }
         }
 
-        const jsonOverride = CATALOG_JSON_COLUMNS[company_code]?.[catalogColumn];
-        const catalogSelectExpr = jsonOverride?.selectExpr ?? (
-            catalogColumn === 'pack_size' ? `split_part(cat.${catalogColumn}, ' ', 1) as pack_size` : `cat.${catalogColumn}`
-        );
-        const isNumericCatalogColumn = catalogColumn === 'list_price';
-        const catalogNullCheckExpr = jsonOverride?.nullCheckExpr ?? (
-            isNumericCatalogColumn ? `cat.${catalogColumn} is not null` : `cat.${catalogColumn} is not null and cat.${catalogColumn} != ''`
-        );
-        const matchDiffCondition = isNumericCatalogColumn
-            ? `(mss.${baseMatchesColumn} is null OR mss.${baseMatchesColumn} != res.${catalogColumn}::float8)`
-            : `(mss.${baseMatchesColumn} is null OR mss.${baseMatchesColumn} = '' OR LOWER(mss.${baseMatchesColumn}) != lower(res.${catalogColumn}))`;
+        // Null-safe on purpose: a null/empty catalog value that differs from the
+        // target IS a discrepancy and gets written (clearing the match attribute).
+        // '' and NULL are treated as the same "empty" state to avoid churn.
+        // Cast to text before LOWER() to handle jsonb columns (text::text is no-op).
+        const matchDiffCondition = spec.isNumeric
+            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value::float8`
+            : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
 
         let query = `
         WITH filtered_catalog AS (
             SELECT DISTINCT
-                ${catalogSelectExpr},
+                ${spec.valueExpr} as sync_value,
                 cat.sku,
                 cat.is_active
-                ${catalogColumn == 'pack_size' ? ', cat.size' : (catalogColumn == 'size' ? `, split_part(cat.pack_size, ' ', 1 ) as pack_size` : '')}
-                ${company_code == 'bjs' && catalogColumn == 'upc' ? ', cat.additional_attributes' : ''}
+                ${companionSelect}
             FROM
                 ${catalog_base_partition} cat
             WHERE
                 cat.capture_date = '${maxCatalogDate}'
                 and cat.company_code = '${company_code}'
-                ${company_code == 'staterbros' ? ` AND cat.is_active` : ''}
-                and ${catalogNullCheckExpr}
+                ${catalogActiveOnly ? ` AND cat.is_active` : ''}
         )
-        UPDATE ${matches_base_partition} mss
-        SET ${baseMatchesColumn} = res.${catalogColumn}
-        ${catalogColumn == 'upc' ? standardizedBaseUpcCondition : ''}
+        UPDATE ${targetTable} mss
+        SET ${spec.target} = ${spec.target === 'base_custom_attributes' ? 'res.sync_value::jsonb' : 'res.sync_value'}
         ${totalSizeCondition}
             , internal_notes = 'match_update_by_catalog_processor: ${current_time}'
         FROM filtered_catalog res
@@ -280,27 +393,22 @@ export async function updateMatchWithCatalog(matches_base_partition, catalog_bas
 }
 
 // Returns matches whose base attribute differs from the latest catalog value
-// (the discrepancy report rows), without mutating anything.
-export async function fetchMatchDifferentWithCatalog(matches_base_partition, catalog_base_partition, maxCatalogDate, catalogColumn, company_code) {
+// (the discrepancy report rows), without mutating anything. `spec` is one
+// buildCatalogSyncPlan() entry, same as updateMatchWithCatalog.
+export async function fetchMatchDifferentWithCatalog(targetTable, catalog_base_partition, maxCatalogDate, spec, company_code, options = {}) {
     try {
-        const baseMatchesColumn = baseMatchesColumnFor(catalogColumn);
+        const { catalogActiveOnly = false } = options;
 
-        const jsonOverride = CATALOG_JSON_COLUMNS[company_code]?.[catalogColumn];
-        const catalogSelectExpr = jsonOverride?.selectExpr ?? (
-            catalogColumn === 'pack_size' ? `split_part(cat.${catalogColumn}, ' ', 1) as pack_size` : `cat.${catalogColumn}`
-        );
-        const isNumericCatalogColumn = catalogColumn === 'list_price';
-        const catalogNullCheckExpr = jsonOverride?.nullCheckExpr ?? (
-            isNumericCatalogColumn ? `cat.${catalogColumn} is not null` : `cat.${catalogColumn} is not null and cat.${catalogColumn} != ''`
-        );
-        const matchDiffCondition = isNumericCatalogColumn
-            ? `(mss.${baseMatchesColumn} is null OR mss.${baseMatchesColumn} != res.${catalogColumn}::float8)`
-            : `(mss.${baseMatchesColumn} is null OR mss.${baseMatchesColumn} = '' OR LOWER(mss.${baseMatchesColumn}) != lower(res.${catalogColumn}))`;
+        // Null-safe on purpose — see updateMatchWithCatalog's matchDiffCondition.
+        // Cast to text before LOWER() to handle jsonb columns (text::text is no-op).
+        const matchDiffCondition = spec.isNumeric
+            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value::float8`
+            : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
 
         let query = `
         WITH filtered_catalog AS (
             SELECT DISTINCT
-                ${catalogSelectExpr},
+                ${spec.valueExpr} as sync_value,
                 cat.sku,
                 is_active
             FROM
@@ -308,8 +416,7 @@ export async function fetchMatchDifferentWithCatalog(matches_base_partition, cat
             WHERE
                 cat.capture_date = '${maxCatalogDate}'
                 and cat.company_code = '${company_code}'
-                ${company_code == 'staterbros' ? ` AND cat.is_active` : ''}
-                and ${catalogNullCheckExpr}
+                ${catalogActiveOnly ? ` AND cat.is_active` : ''}
         )
         select
             mss.match_id,
@@ -328,6 +435,7 @@ export async function fetchMatchDifferentWithCatalog(matches_base_partition, cat
             mss.base_uom,
             mss.base_size,
             mss.base_brandtype,
+            mss.base_brand,
             mss.base_title,
             mss.base_pack_size,
             mss.base_total_size,
@@ -336,10 +444,15 @@ export async function fetchMatchDifferentWithCatalog(matches_base_partition, cat
             mss.normalized_comp_total_size,
             mss.segment,
             mss.comp_upc,
+            mss.comp_brand,
+            mss.base_mfr_part_number,
+            mss.comp_mfr_part_number,
+            mss.active,
+            mss.match,
             mss.model_used,
-            '${baseMatchesColumn} is not matching' as update_reason,
-            res.${catalogColumn} as updated_value
-            FROM ${matches_base_partition} mss
+            '${spec.target} is not matching' as update_reason,
+            res.sync_value as updated_value
+            FROM ${targetTable} mss
             INNER JOIN filtered_catalog res ON mss.base_sku = res.sku
             WHERE
             mss.company_code = '${company_code}'
@@ -355,138 +468,103 @@ export async function fetchMatchDifferentWithCatalog(matches_base_partition, cat
     }
 }
 
-// Active UOM normalization map keyed by `${company_code}-${ORIGINAL_UOM}`.
-export async function getUomNormalizationData() {
+// Catalog-active flag sync for the tpvr_<cc> table. Mirrors the catalog row's
+// own is_active value onto is_catalog_active for every base_sku that HAS a row
+// in the latest catalog capture (bidirectional: flips to false when the
+// catalog marks it inactive, back to true when it's active again). base_skus
+// with no row at all in the latest capture are left untouched — absence alone
+// doesn't imply inactive. Only rows whose flag would actually change are
+// written, and the changed rows are RETURNed for reporting.
+//
+//   targetTable         - tpvr_<cc> or a matches base table (must have the
+//                         is_catalog_active column; skipped with a log if not)
+//   catalog_base_partition / maxCatalogDate / company_code - the latest catalog
+export async function syncCatalogActiveFlag(targetTable, catalog_base_partition, maxCatalogDate, company_code) {
     try {
-        const query = `
-            SELECT UPPER(original_uom) AS original_uom, UPPER(normalized_uom) AS normalized_uom,
-                    LOWER(company_code) AS company_code
-                    FROM uom_normalized_data
-                    WHERE active = true
-        `.replace(/\n|\t/g, '');
-        const rows = await runQuery(query);
-        const uomNormalizationData = {};
-        for (const row of rows) {
-            uomNormalizationData[`${row.company_code}-${row.original_uom}`] = row.normalized_uom;
-        }
-        return uomNormalizationData;
-    } catch (error) {
-        console.log(`${moment().format()} - getUomNormalizationData error: ${error.message}`);
-        return {};
-    }
-}
-
-// Active UOM size-conversion map keyed by `${company_code}-${BASE_UOM}-${COMP_UOM}`.
-export async function getUomSizeConversionData() {
-    try {
-        const query = `
-            SELECT UPPER(normalized_base_uom) AS normalized_base_uom, UPPER(normalized_comp_uom) AS normalized_comp_uom, LOWER(company_code) AS company_code,
-                   conversion_factor
-            FROM uom_size_conversion_data
-            WHERE active = true
-        `.replace(/\n|\t/g, '');
-        const rows = await runQuery(query);
-        const uomSizeConversionData = {};
-        for (const row of rows) {
-            uomSizeConversionData[`${row.company_code}-${row.normalized_base_uom}-${row.normalized_comp_uom}`] = row.conversion_factor;
-        }
-        return uomSizeConversionData;
-    } catch (error) {
-        console.log(`${moment().format()} - getUomSizeConversionData error: ${error.message}`);
-        return {};
-    }
-}
-
-// Bulk-updates normalized UOM/size columns via a single VALUES-join UPDATE.
-export async function updateNormalizedAttributes(updates, companyCode) {
-    try {
-        if (!updates || Object.keys(updates).length === 0) return '';
-
-        const allCols = new Set();
-        Object.values(updates).forEach(obj => {
-            Object.keys(obj).forEach(col => allCols.add(col));
-        });
-
-        const orderedCols = ['match_id', ...Array.from(allCols)];
-        const valueRows = [];
-
-        for (const [match_id, values] of Object.entries(updates)) {
-            const row = [`'${match_id}'`, ...orderedCols.slice(1).map(col => {
-                let val = values[col];
-                if (val === undefined || val === null) return 'NULL';
-                if (typeof val === 'string') {
-                    val = val.replace(/'/g, "''");
-                    return `'${val}'`;
-                }
-                return val;
-            })];
-            valueRows.push(`(${row.join(', ')})`);
+        // Guard: the column is provisioned on tpvr_<cc> today but may not yet
+        // exist on the matches tables. Skip (don't crash the tenant) until the
+        // DDL lands — the sync activates automatically once it does.
+        const targetCols = await getSchema(targetTable);
+        if (!targetCols.some(c => c.column_name === 'is_catalog_active')) {
+            console.log(`syncCatalogActiveFlag: ${targetTable} has no is_catalog_active column - skipping`);
+            return [];
         }
 
-        const setClause = orderedCols.slice(1)
-            .map(col => `${col} = c.${col}`)
-            .join(', ');
-
-        const query = `
-          UPDATE matches_${companyCode}_${companyCode}_${companyCode} AS m
-          SET ${setClause}
-          FROM (
-            VALUES
-              ${valueRows.join(',\n        ')}
-          ) AS c(${orderedCols.join(', ')})
-          WHERE m.match_id = c.match_id;
+        let query = `
+        WITH latest_catalog AS (
+            SELECT lower(sku) AS sku, bool_or(is_active) AS is_active
+            FROM ${catalog_base_partition}
+            WHERE capture_date = '${maxCatalogDate}'
+              AND company_code = '${company_code}'
+            GROUP BY lower(sku)
+        ),
+        target_state AS (
+            SELECT t2.match_id, COALESCE(lc.is_active, false) AS in_catalog
+            FROM ${targetTable} t2
+            LEFT JOIN latest_catalog lc ON lower(t2.base_sku) = lc.sku
+            WHERE t2.company_code = '${company_code}'
+              AND t2.deleted_date IS NULL
+        )
+        UPDATE ${targetTable} t
+        SET is_catalog_active = ts.in_catalog
+        FROM target_state ts
+        WHERE t.match_id = ts.match_id
+          AND t.is_catalog_active IS DISTINCT FROM ts.in_catalog
+        RETURNING t.match_id, t.base_sku, t.comp_sku, t.comp_source_store, ts.in_catalog AS is_catalog_active;
         `;
+        query = query.replace(/\n|\t/g, '');
 
-        return await runQuery(query);
+        const rows = await runQuery(query);
+        return rows || [];
     } catch (error) {
-        console.log(`updateNormalizedAttributes err: ${error.message}`);
+        console.log(`syncCatalogActiveFlag err for ${targetTable}: ${error.message}`);
         return [];
     }
 }
 
-// Per-match attribute UPDATEs (one statement per match_id), batched together.
-export async function updateAttributes(updates, companyCode) {
+function formatSqlLiteral(val) {
+    if (val === null) return 'NULL';                 // explicit null = clear the column
+    if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
+    if (typeof val === 'string') {
+        const escaped = val.replace(/'/g, "''");
+        // If it looks like a date, cast as timestamp
+        return /^\d{4}-\d{2}-\d{2}T/.test(val) ? `'${escaped}'::timestamp` : `'${escaped}'`;
+    }
+    return val;
+}
+
+// Cap on rows per UPDATE ... FROM (VALUES ...) statement, so a large sync run
+// (e.g. a mass UPC change) can't build one unbounded SQL string — each chunk
+// stays a small, fast statement instead.
+const ATTRIBUTE_UPDATE_CHUNK_SIZE = 5;
+
+// Per-match attribute UPDATE, batched into set-based UPDATE ... FROM (VALUES ...)
+// statements (ATTRIBUTE_UPDATE_CHUNK_SIZE rows per statement) instead of one
+// UPDATE per match_id. Assumes every row sets the same columns — true for the
+// only caller (multi-UPC resolution in catalog_sync.js, which always sets
+// base_upc + internal_notes).
+export async function updateAttributes(updates, companyCode, targetTable = `matches_${companyCode}_${companyCode}_${companyCode}`) {
     try {
-        if (!updates || Object.keys(updates).length === 0) return '';
+        const entries = Object.entries(updates || {});
+        if (!entries.length) return;
 
-        const updateQueries = [];
+        const columns = Object.keys(entries[0][1]);
 
-        for (const [match_id, values] of Object.entries(updates)) {
-            const setClauses = [];
-
-            for (const [col, val] of Object.entries(values)) {
-                if (val === null || val === undefined) continue;
-
-                let formattedVal;
-                if (typeof val === 'boolean') {
-                    formattedVal = val ? 'TRUE' : 'FALSE';
-                } else if (typeof val === 'string') {
-                    const escaped = val.replace(/'/g, "''");
-                    // If it looks like a date, cast as timestamp
-                    if (/^\d{4}-\d{2}-\d{2}T/.test(val)) {
-                        formattedVal = `'${escaped}'::timestamp`;
-                    } else {
-                        formattedVal = `'${escaped}'`;
-                    }
-                } else {
-                    formattedVal = val;
-                }
-
-                setClauses.push(`${col} = ${formattedVal}`);
-            }
-
-            if (setClauses.length === 0) continue;
+        for (let i = 0; i < entries.length; i += ATTRIBUTE_UPDATE_CHUNK_SIZE) {
+            const chunk = entries.slice(i, i + ATTRIBUTE_UPDATE_CHUNK_SIZE);
+            const valuesList = chunk
+                .map(([match_id, values]) => `('${match_id}', ${columns.map(col => formatSqlLiteral(values[col])).join(', ')})`)
+                .join(', ');
 
             const query = `
-              UPDATE matches_${companyCode}_${companyCode}_${companyCode}
-              SET ${setClauses.join(', ')}
-              WHERE match_id = '${match_id}';
+                UPDATE ${targetTable} mss
+                SET ${columns.map(col => `${col} = v.${col}`).join(', ')}
+                FROM (VALUES ${valuesList}) AS v(match_id, ${columns.join(', ')})
+                WHERE mss.match_id::text = v.match_id;
             `;
-            updateQueries.push(query);
-        }
 
-        const finalQuery = updateQueries.join('\n');
-        return await runQuery(finalQuery);
+            await runQuery(query);
+        }
     } catch (error) {
         console.error(`updateAttributes err: ${error.message}`);
         return [];

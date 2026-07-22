@@ -120,8 +120,16 @@ export async function createMatchUpdateReport(fullPath, data, keysToUpdate) {
 // bucket; here we stage under the OS temp dir and upload to GCS (gcs_bucket),
 // keeping the identical `catalog_sync_updated_matches/...` key layout. Returns
 // the upload key prefix on success, or false when there was nothing to upload.
-export async function generateMatchesUpdatedReportWithCatalog(company_code, metrics) {
+//
+// `catalogActiveChanges` (optional) is the list of tpvr rows whose
+// is_catalog_active flag flipped this run (from syncCatalogActiveFlag). When
+// present it is written as a second CSV alongside the updated-matches CSV and
+// its counts are added to the summary.
+export async function generateMatchesUpdatedReportWithCatalog(company_code, metrics, catalogActiveChanges = [], reportType = 'matches') {
     try {
+        metrics = metrics || [];
+        catalogActiveChanges = catalogActiveChanges || [];
+
         const stageDir = CATALOG_SYNC_STAGE_DIR;
         if (!fs.existsSync(stageDir)) fs.mkdirSync(stageDir, { recursive: true });
 
@@ -130,8 +138,24 @@ export async function generateMatchesUpdatedReportWithCatalog(company_code, metr
         const date = moment();
         const keyPrefix = `catalog_sync_updated_matches/company_code=${company_code}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/`;
 
-        const deletedFilename = `matches_cleanup_${date.format('YYYY-MM-DD-HH')}${localRun ? '_local' : ''}.csv`;
+        const deletedFilename = `${reportType}_updated_${date.format('YYYY-MM-DD-HH')}${localRun ? '_local' : ''}.csv`;
         const deleted = metrics;
+
+        // Second CSV: tpvr rows whose is_catalog_active flag changed this run.
+        if (catalogActiveChanges.length > 0) {
+            const caColumns = Object.keys(catalogActiveChanges[0]);
+            const caHeader = caColumns.map(col => ({ id: col, title: col }));
+            const caFilename = `catalog_active_changes_${date.format('YYYY-MM-DD-HH')}${localRun ? '_local' : ''}.csv`;
+            const caPath = path.join(stageDir, caFilename);
+            const caCsvWriter = createObjectCsvWriter({ path: caPath, header: caHeader });
+
+            await caCsvWriter.writeRecords(catalogActiveChanges);
+            await gcs.uploadObject({
+                Key: `${keyPrefix}${caFilename}`,
+                Body: fs.readFileSync(caPath)
+            });
+            dataUploaded = true;
+        }
 
         if (deleted.length > 0) {
             const columns = Object.keys(deleted[0]);
@@ -149,9 +173,12 @@ export async function generateMatchesUpdatedReportWithCatalog(company_code, metr
 
         if (dataUploaded) {
             const uniqueBaseSkus = [...new Set(metrics.map(item => item.base_sku))];
-            const baseSkusWithUrlMismatch = metrics.filter(item => item.update_reason === 'base_url is not matching').map(item => item.base_sku);
-            const baseSkusWithSizeMismatch = metrics.filter(item => item.update_reason === 'base_size is not matching').map(item => item.base_sku);
-            const baseSkusWithUomMismatch = metrics.filter(item => item.update_reason === 'base_uom is not matching').map(item => item.base_sku);
+            const baseSkusWithUrlMismatch = metrics.filter(item => item.column === 'base_url').map(item => item.base_sku);
+            const baseSkusWithSizeMismatch = metrics.filter(item => item.column === 'base_size').map(item => item.base_sku);
+            const baseSkusWithUomMismatch = metrics.filter(item => item.column === 'base_uom').map(item => item.base_sku);
+
+            const deactivated = catalogActiveChanges.filter(r => r.is_catalog_active === false).length;
+            const reactivated = catalogActiveChanges.filter(r => r.is_catalog_active === true).length;
 
             const mailContent = `
             Catalog Sync Up Report for ${company_code}:
@@ -162,9 +189,11 @@ export async function generateMatchesUpdatedReportWithCatalog(company_code, metr
             - base_sku's with 'base_url not matching': ${baseSkusWithUrlMismatch.length}
             - base_sku's with 'base_size not matching': ${baseSkusWithSizeMismatch.length}
             - base_sku's with 'base_uom not matching': ${baseSkusWithUomMismatch.length}
+            - tpvr is_catalog_active set false (sku dropped from catalog): ${deactivated}
+            - tpvr is_catalog_active set true (sku back in catalog): ${reactivated}
             `;
 
-            const reportFilename = `report_${company_code}_${date.format('YYYY-MM-DD-HH')}${localRun ? '_local' : ''}.txt`;
+            const reportFilename = `report_${reportType}_${company_code}_${date.format('YYYY-MM-DD-HH')}${localRun ? '_local' : ''}.txt`;
             const reportPath = path.join(stageDir, reportFilename);
             fs.writeFileSync(reportPath, mailContent);
 
