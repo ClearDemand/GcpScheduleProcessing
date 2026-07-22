@@ -10,6 +10,7 @@ import path from 'path';
 import moment from 'moment';
 import csvWriterPkg from 'csv-writer';
 import * as gcs from './gcs_resources.js';
+import { isSentinelValue } from './match_update_constants.js';
 
 const { createObjectCsvWriter } = csvWriterPkg;
 
@@ -63,6 +64,52 @@ export function removeDirectory(directory) {
         fs.rmSync(directory, { recursive: true, force: true });
     } catch (error) {
         console.log(`removeDirectory error: ${error.message}`);
+    }
+}
+
+// Match-update-processor report CSV. Ported from PmtScheduleProcessing
+// node_utils.createCsvForMatchUpdateProcessor — writes to an absolute path
+// (staged under os.tmpdir() by the caller) instead of the old relative
+// `S3Uploads/` dir. `data` is the batch's expanded per-match result array
+// (each item has `.processed.modified`/`.processed.status` plus flattened
+// `updated_<key>`/`<key>` fields, per jobs/match_update_processor.js).
+export async function createMatchUpdateReport(fullPath, data, keysToUpdate) {
+    try {
+        if (!data || !Array.isArray(data) || data.length === 0) {
+            return false;
+        }
+
+        const keysToProcess = [...keysToUpdate];
+        if (keysToUpdate.includes('comp_brand')) {
+            keysToProcess.push('comp_brandtype');
+        }
+
+        for (const match of data) {
+            if (!match.processed?.modified) continue;
+            for (const key of keysToProcess) {
+                if (match[`updated_${key}`]) continue;
+                let value = match[key];
+                if (typeof value === 'object' && value !== null) {
+                    value = JSON.stringify(value);
+                } else if (isSentinelValue(value)) {
+                    value = null;
+                }
+                match[`updated_${key}`] = value || null;
+            }
+        }
+
+        let headers = ['match_id', 'company_code', 'base_sku', 'base_source_store', 'comp_sku', 'comp_source_store', 'modified', 'status'];
+        for (const key of keysToProcess) {
+            headers.push(`updated_${key}`, key);
+        }
+        headers = headers.map(v => ({ id: v, title: v }));
+
+        const writer = createObjectCsvWriter({ path: fullPath, header: headers });
+        await writer.writeRecords(data);
+        return true;
+    } catch (error) {
+        console.log(`${moment().format()} - error in createMatchUpdateReport: ${error.message}`);
+        return false;
     }
 }
 

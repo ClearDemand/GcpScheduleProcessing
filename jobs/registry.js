@@ -9,8 +9,15 @@
 //
 //  Fields:
 //    handlerPath - ES module exporting run(env), relative to repo root (with .js)
-//    schedule    - cron expression for Cloud Scheduler
-//    timezone    - IANA tz for the schedule
+//    schedule    - cron expression for Cloud Scheduler. Omit for a trigger-only
+//                  job (see triggerOnly below) — do not just leave it out by
+//                  accident, a cron job with a missing schedule should fail
+//                  loudly rather than silently deploy without a trigger.
+//    timezone    - IANA tz for the schedule (only meaningful with `schedule`)
+//    triggerOnly - true for jobs with no Cloud Scheduler trigger at all; they
+//                  still deploy as a Cloud Run Job, invoked on demand by
+//                  another service via the Cloud Run Admin API (IAM-gated,
+//                  see deploy_jobs.sh's MATCH_UPDATE_INVOKER_SA-style grants).
 //    timeout     - Cloud Run Job task timeout (e.g. '1800s' = 30m)
 //    memory      - Cloud Run Job memory
 //    env         - per-job env passed to run(); also set on the Cloud Run Job
@@ -36,6 +43,28 @@ export default {
         timezone: 'Asia/Kolkata',
         timeout: '3600s',
         memory: '4Gi',
+        env: {}
+    },
+    'match-update-processor': {
+        handlerPath: './jobs/match_update_processor.js',
+        // No schedule — triggered on demand (via the Cloud Run Admin API's
+        // jobs.run) by whatever service inserts a row into matches_update_queue.
+        triggerOnly: true,
+        timeout: '1800s',
+        memory: '1Gi',
+        env: {}
+    },
+    'auto-ingestion-processor': {
+        handlerPath: './jobs/auto_ingestion_processor.js',
+        // No schedule — triggered on demand (via the Cloud Run Admin API's
+        // jobs.run) by matchlibrary-baas's POST /matches/auto-ingestion/trigger,
+        // after it inserts a row into auto_ingestion_trigger_queue.
+        triggerOnly: true,
+        // Generous vs match-update-processor's 1800s: Athena queries plus
+        // per-chunk HTTP round-trips to matchlibrary-baas replace what used to
+        // be in-process DB writes.
+        timeout: '3600s',
+        memory: '1Gi',
         env: {}
     }
 };

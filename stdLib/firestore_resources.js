@@ -124,6 +124,26 @@ export async function getTenantCompetitors(tenant_code, filters, responseKeys) {
 // Competitor store mapping for a tenant, shaped like the old `domains` rows:
 //   [{ source_store, client_specific_store_name, display }]
 export async function getDomainsForClient(companyCode) {
+    const data = await getCompanyDoc(companyCode);
+    if (!data) return false;
+
+    const banners = (data.competitor_banners || []).filter(b => b.is_banner_inactive !== true);
+    return banners.map(b => ({
+        source_store: b.key,
+        client_specific_store_name: b.client_specific_store_name || b.display,
+        display: b.display
+    }));
+}
+
+// Full company-code doc for a tenant (banners, copy_brand_type, etc.), used by
+// the match-update-processor job. GCP replacement for the old DynamoDB
+// company_code_library.getCompanyKey(company_code). Returns false if the
+// tenant has no company-code doc.
+export async function getCompanyKey(companyCode) {
+    return getCompanyDoc(companyCode);
+}
+
+async function getCompanyDoc(companyCode) {
     const snapshot = await firestore
         .collection(process.env.company_code_collection)
         .where('company_code', '==', companyCode)
@@ -132,11 +152,6 @@ export async function getDomainsForClient(companyCode) {
     if (snapshot.empty) return false;
 
     const data = snapshot.docs[0].data();
-    const banners = (data.competitor_banners || []).filter(b => b.is_banner_inactive !== true);
-
-    return banners.map(b => ({
-        source_store: b.key,
-        client_specific_store_name: b.client_specific_store_name || b.display,
-        display: b.display
-    }));
+    data.competitor_banners = (data.competitor_banners || []).filter(b => b.is_banner_inactive !== true);
+    return data;
 }

@@ -118,6 +118,16 @@ provision_iam() {
     grant "run.invoker (scheduler)" \
         gcloud projects add-iam-policy-binding "$PROJECT" \
             --member="serviceAccount:${SCHED_SA}" --role="roles/run.invoker" --condition=None
+
+    # Run SA: sign its own GCS V4 signed URLs (report download links). Cloud
+    # Run's keyless ADC signs via the IAM Credentials signBlob API, which
+    # requires the calling identity to hold this role on itself — without it,
+    # getSignedUrl() fails at runtime with a permission error, not a deploy-time
+    # one.
+    grant "iam.serviceAccountTokenCreator (self, for GCS V4 signed URLs)" \
+        gcloud iam service-accounts add-iam-policy-binding "$RUN_SA" \
+            --project "$PROJECT" --member="serviceAccount:${RUN_SA}" \
+            --role="roles/iam.serviceAccountTokenCreator"
 }
 
 if [ "${SETUP_IAM:-true}" = "true" ]; then
@@ -129,10 +139,12 @@ echo "==> Building image ${IMAGE}"
 gcloud builds submit --project "$PROJECT" --tag "$IMAGE" .
 
 # Emit one line per job from the registry: name|schedule|timezone|timeout|memory
+# schedule/timezone default to "" for trigger-only jobs (no Cloud Scheduler
+# entry); timeout defaults to 600s if a trigger-only job omits it.
 JOBS="$(node --input-type=module -e '
 import r from "./jobs/registry.js";
 for (const [name, j] of Object.entries(r)) {
-  console.log([name, j.schedule, j.timezone, j.timeout, j.memory || "512Mi"].join("|"));
+  console.log([name, j.schedule || "", j.timezone || "", j.timeout || "600s", j.memory || "512Mi"].join("|"));
 }')"
 
 while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
@@ -173,24 +185,51 @@ while IFS='|' read -r NAME SCHEDULE TIMEZONE TIMEOUT MEMORY; do
         --cpu "$CPU" \
         --max-retries 2 \
         --service-account "$RUN_SA" \
+        --vpc-connector retailscape-vpc-connector \
+        --vpc-egress private-ranges-only \
         --set-env-vars "$ENV_VARS"
 
-    echo "==> Scheduling trigger: trigger-${NAME} (${SCHEDULE} ${TIMEZONE})"
-    RUN_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${NAME}:run"
+    if [ -n "$SCHEDULE" ]; then
+        echo "==> Scheduling trigger: trigger-${NAME} (${SCHEDULE} ${TIMEZONE})"
+        RUN_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${NAME}:run"
 
-    if gcloud scheduler jobs describe "trigger-${NAME}" --project "$PROJECT" --location "$SCHED_REGION" >/dev/null 2>&1; then
-        gcloud scheduler jobs update http "trigger-${NAME}" \
-            --project "$PROJECT" --location "$SCHED_REGION" \
-            --schedule "$SCHEDULE" --time-zone "$TIMEZONE" \
-            --uri "$RUN_URI" --http-method POST \
-            --oauth-service-account-email "$SCHED_SA"
+        if gcloud scheduler jobs describe "trigger-${NAME}" --project "$PROJECT" --location "$SCHED_REGION" >/dev/null 2>&1; then
+            gcloud scheduler jobs update http "trigger-${NAME}" \
+                --project "$PROJECT" --location "$SCHED_REGION" \
+                --schedule "$SCHEDULE" --time-zone "$TIMEZONE" \
+                --uri "$RUN_URI" --http-method POST \
+                --oauth-service-account-email "$SCHED_SA"
+        else
+            gcloud scheduler jobs create http "trigger-${NAME}" \
+                --project "$PROJECT" --location "$SCHED_REGION" \
+                --schedule "$SCHEDULE" --time-zone "$TIMEZONE" \
+                --uri "$RUN_URI" --http-method POST \
+                --oauth-service-account-email "$SCHED_SA"
+        fi
     else
-        gcloud scheduler jobs create http "trigger-${NAME}" \
-            --project "$PROJECT" --location "$SCHED_REGION" \
-            --schedule "$SCHEDULE" --time-zone "$TIMEZONE" \
-            --uri "$RUN_URI" --http-method POST \
-            --oauth-service-account-email "$SCHED_SA"
+        echo "==> No schedule for ${NAME}; skipping Cloud Scheduler (trigger-only job)."
     fi
+
+    # Trigger-only jobs need an external caller authorized to invoke *this*
+    # job specifically. match-update-processor and
+    # auto-ingestion-processor are both invoked by the same caller
+    # (matchlibrary-baas's Cloud Function runtime SA), so they share one
+    # invoker-SA variable. MATCHLIBRARY_BAAS_INVOKER_SA is unset by default
+    # (safe: the job just stays uninvokable by anyone but existing job-runner
+    # principals) until the calling service's account email is known.
+    # MATCH_UPDATE_INVOKER_SA is accepted as a fallback for anyone who already
+    # has it set from before auto-ingestion-processor existed.
+    INVOKER_SA="${MATCHLIBRARY_BAAS_INVOKER_SA:-${MATCH_UPDATE_INVOKER_SA:-}}"
+    case "$NAME" in
+        match-update-processor|auto-ingestion-processor)
+            if [ -n "$INVOKER_SA" ]; then
+                grant "run.invoker (${INVOKER_SA}) on ${NAME}" \
+                    gcloud run jobs add-iam-policy-binding "$NAME" \
+                        --project "$PROJECT" --region "$REGION" \
+                        --member="serviceAccount:${INVOKER_SA}" --role="roles/run.invoker"
+            fi
+            ;;
+    esac
 done <<< "$JOBS"
 
 echo ""
