@@ -150,7 +150,7 @@ async function uploadReport(companyCode, results) {
         const created = await createCsvFile(stagePath(filename), results);
         if (!created) return null;
 
-        const key = `auto_ingestion/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/${filename}`;
+        const key = `upc_auto_ingestion/company_code=${companyCode}/year=${date.format('YYYY')}/month=${date.format('MM')}/day=${date.format('DD')}/${filename}`;
         await s3.uploadObject({ Key: key, Body: fs.readFileSync(stagePath(filename)) });
         return await s3.getSignedDownloadUrl(key);
     } catch (err) {
