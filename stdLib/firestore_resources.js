@@ -63,22 +63,6 @@ export async function getClientsEnabledForCatalogSyncProcess() {
     }
 }
 
-// Shared catalog attribute mapping for the catalog sync job: the declarative
-// catalog-column -> base_* column specs, one doc for all tenants (per-tenant
-// behaviour is expressed via `enabled_by_flag` references to flags on the
-// company-code docs). Provisioned by scripts/provision_catalog_attribute_mapping.js.
-export async function getCatalogAttributeMapping() {
-    try {
-        const collectionName = process.env.catalog_sync_config_collection || 'catalog_sync_config';
-        const snapshot = await firestore.collection(collectionName).doc('attribute_mapping').get();
-        if (!snapshot.exists) return null;
-        return snapshot.data().catalog_attribute_mapping || null;
-    } catch (error) {
-        console.log(`getCatalogAttributeMapping error: ${error.message}`);
-        return null;
-    }
-}
-
 // Full company-code doc for a tenant. Mirrors matchlibrary-baas
 // MatchesDao.getTenantInfo.
 export async function getTenantInfo(tenant_code) {

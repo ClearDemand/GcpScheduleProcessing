@@ -6,12 +6,14 @@
 //  company-code library, it brings the tenant's match rows in sync with the
 //  latest catalog capture:
 //
-//    - derives the columns to sync from the Firestore catalog attribute mapping
-//      (catalog_sync_config/attribute_mapping, provisioned by
-//      scripts/provision_catalog_attribute_mapping.js) — the mapping declares
+//    - derives the columns to sync from DEFAULT_CATALOG_ATTRIBUTE_MAPPING
+//      (stdLib/catalog_attribute_mapping.js) — a codebase default declaring
 //      each base_* target column and how its value comes out of the catalog
-//      (coalesce chains, JSON extraction, transforms), and only entries whose
-//      source/target columns exist on this tenant's tables are run;
+//      (coalesce chains, JSON extraction, transforms). A tenant that needs a
+//      different mapping sets `catalog_attribute_mapping_overrides` (a partial
+//      object, same shape) on its company-code doc; buildCatalogSyncPlan merges
+//      it over the default column-by-column. Only entries whose source/target
+//      columns exist on this tenant's tables are run;
 //    - reconciles the tpvr-only `is_catalog_active` flag: false for base_skus no
 //      longer in the latest catalog, true for those present again (bidirectional);
 //    - records the synced capture_date in catalog_version and uploads a report.
@@ -55,22 +57,13 @@ export async function run() {
     try {
         await aurora.init();
 
-        const mapping = await firestore.getCatalogAttributeMapping();
-        if (!mapping) {
-            const message = 'catalog_attribute_mapping doc missing in Firestore (catalog_sync_config/attribute_mapping) - '
-                + 'run scripts/provision_catalog_attribute_mapping.js. Aborting: no tenant processed.';
-            console.log(`${moment().format()} ${jobName} | ${message}`);
-            await notifySlackStatus(jobName, 'ERROR', 'all', message, true);
-            return;
-        }
-
         const clients = await firestore.getClientsEnabledForCatalogSyncProcess();
         console.log(`${moment().format()} ${jobName} | ${clients.length} client(s) with catalog_syncup_process enabled (ENV=${process.env.ENV || 'dev'})`);
 
         const forceSync = process.env.CATALOG_SYNC_FORCE === 'true';
         for (const client of clients) {
-            await processSyncUp(client, mapping, forceSync);
-    }
+            await processSyncUp(client, forceSync);
+        }
     } finally {
         // Post-job cleanup: drop the staging dir so the last tenant's report
         // files don't linger in Cloud Run's RAM-backed temp dir after exit.
@@ -93,7 +86,7 @@ function deriveTenantFlags(client) {
     };
 }
 
-async function processSyncUp(client, mapping, forceSync = false) {
+async function processSyncUp(client, forceSync = false) {
     const company_code = client.company_code;
     try {
         const suffix = `_${company_code}_${company_code}_${company_code}`;
@@ -154,7 +147,7 @@ async function processSyncUp(client, mapping, forceSync = false) {
         //    by the comp_source_store column (the same way match_library_gcs_export
         //    and matchlibrary-baas address them) — so a single pass over the base
         //    table covers all competitors.
-        const matchesPlan = await aurora.buildCatalogSyncPlan(catalogBasePartition, matchesBasePartition, mapping, client);
+        const matchesPlan = await aurora.buildCatalogSyncPlan(catalogBasePartition, matchesBasePartition, client);
         if (matchesPlan.length) {
             await syncCatalogColumns({
                 table: matchesBasePartition,
@@ -167,7 +160,7 @@ async function processSyncUp(client, mapping, forceSync = false) {
         }
 
         // 2) tpvr: a single per-tenant table (same row shape as matches).
-        const tpvrPlan = await aurora.buildCatalogSyncPlan(catalogBasePartition, tpvrTable, mapping, client);
+        const tpvrPlan = await aurora.buildCatalogSyncPlan(catalogBasePartition, tpvrTable, client);
         if (tpvrPlan.length) {
             await syncCatalogColumns({
                 table: tpvrTable,

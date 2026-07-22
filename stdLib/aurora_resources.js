@@ -11,6 +11,7 @@
 import pkg from 'pg';
 import moment from 'moment';
 import { getSecretAsJson } from './secret_manager_resources.js';
+import { DEFAULT_CATALOG_ATTRIBUTE_MAPPING } from './catalog_attribute_mapping.js';
 
 const { Pool } = pkg;
 
@@ -141,14 +142,14 @@ export async function getSchema(table) {
 }
 
 // ============================================================================
-//  Catalog-sync plan — driven by the Firestore catalog_attribute_mapping doc
-//  (catalog_sync_config/attribute_mapping, provisioned by
-//  scripts/provision_catalog_attribute_mapping.js). Replaces the previous
-//  hardcoded catalog-column -> base_* switch, the CATALOG_JSON_COLUMNS const
-//  and the exclusion-list schema discovery: the mapping is now the single
-//  authority on WHICH base_* columns sync and HOW their value is derived.
-//  buildCatalogSyncPlan() compiles the entries that apply to a tenant + target
-//  table into the SQL fragments fetch/updateMatchWithCatalog consume.
+//  Catalog-sync plan — driven by DEFAULT_CATALOG_ATTRIBUTE_MAPPING
+//  (stdLib/catalog_attribute_mapping.js), overridable per tenant via
+//  `catalog_attribute_mapping_overrides` on the company-code doc. Replaces the
+//  previous hardcoded catalog-column -> base_* switch, the CATALOG_JSON_COLUMNS
+//  const and the exclusion-list schema discovery: the mapping is now the
+//  single authority on WHICH base_* columns sync and HOW their value is
+//  derived. buildCatalogSyncPlan() compiles the entries that apply to a tenant
+//  + target table into the SQL fragments fetch/updateMatchWithCatalog consume.
 // ============================================================================
 
 // information_schema data_types treated as numeric for diff comparisons —
@@ -220,13 +221,20 @@ function buildColumnSpec(target, entry, catalogTypes) {
     return { target, valueExpr, isNumeric };
 }
 
-// Compiles the Firestore mapping into the per-column sync plan for one tenant
+// Compiles the effective mapping into the per-column sync plan for one tenant
 // and target table (matches_<cc>_<cc>_<cc> or tpvr_<cc>): only entries whose
 // target column exists on the table and whose flags are on for this client.
-//   mapping - the catalog_attribute_mapping doc (firestore_resources)
-//   client  - the tenant's company-code doc (source of the behaviour flags)
-export async function buildCatalogSyncPlan(catalogTable, targetTable, mapping, client) {
+// The effective mapping is DEFAULT_CATALOG_ATTRIBUTE_MAPPING with any
+// per-tenant `catalog_attribute_mapping_overrides` on the company-code doc
+// merged on top, column by column (an override entry replaces the default
+// entry for that column wholesale; columns without an override keep the
+// default). Most tenants have no overrides and just get the default.
+//   client - the tenant's company-code doc (source of the behaviour flags and
+//            any catalog_attribute_mapping_overrides)
+export async function buildCatalogSyncPlan(catalogTable, targetTable, client) {
     try {
+        const mapping = { ...DEFAULT_CATALOG_ATTRIBUTE_MAPPING, ...(client.catalog_attribute_mapping_overrides || {}) };
+
         const catalogTypes = new Map((await getSchema(catalogTable)).map(r => [r.column_name, r.data_type]));
         const targetCols = new Set((await getSchema(targetTable)).map(r => r.column_name));
 
