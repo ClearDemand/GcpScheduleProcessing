@@ -44,5 +44,18 @@ export default {
         timeout: '1800s',
         memory: '1Gi',
         env: {}
+    },
+    'auto-ingestion-processor': {
+        handlerPath: './jobs/auto_ingestion_processor.js',
+        // No schedule — triggered on demand (via the Cloud Run Admin API's
+        // jobs.run) by matchlibrary-baas's POST /matches/auto-ingestion/trigger,
+        // after it inserts a row into auto_ingestion_trigger_queue.
+        triggerOnly: true,
+        // Generous vs match-update-processor's 1800s: Athena queries plus
+        // per-chunk HTTP round-trips to matchlibrary-baas replace what used to
+        // be in-process DB writes.
+        timeout: '3600s',
+        memory: '1Gi',
+        env: {}
     }
 };

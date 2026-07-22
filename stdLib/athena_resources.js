@@ -85,6 +85,29 @@ async function fetchAllRows(QueryExecutionId) {
 
 const escapeSql = v => `${v}`.replace(/'/g, "''");
 
+const UPC_MATCHES_DB = 'ml_stack_prod_matches';
+
+// ML-suggested UPC auto-approval matches for one client/day. Ported from
+// PmtScheduleProcessing/stdLib/athena_resources.js#getUpcMatchesToProcess
+// (same SQL, minus the athena-express wrapper -- see this file's header).
+// The legacy call passed an arbitrary 'temp' database label to athena-express
+// (the query's FROM clause is already fully schema-qualified, so it barely
+// mattered); this passes the actual schema name instead, for clarity.
+export async function getUpcMatchesToProcess(companyCode, loadDate) {
+    try {
+        return await runAthenaQuery(
+            `SELECT * FROM ${UPC_MATCHES_DB}.auto_approval_matches
+             WHERE company_code = '${escapeSql(companyCode)}'
+             AND model_used != 'automation-reactivated-matches'
+             AND load_date = '${escapeSql(loadDate)}'`,
+            UPC_MATCHES_DB
+        );
+    } catch (err) {
+        console.log(`getUpcMatchesToProcess err: ${err.message}`);
+        return [];
+    }
+}
+
 // Authoritative pricing-parquet rows for a batch of matches. Two-step query:
 // (1) find the latest year/month/day partition for the tenant, (2) pull the
 // requested attribute columns for exactly the (base_sku, comp_source_store,
