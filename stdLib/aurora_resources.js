@@ -187,22 +187,28 @@ function buildColumnSpec(target, entry, catalogTypes) {
         if (!catalogTypes.has(entry.source)) return null;
         // Safely extract from JSON: validate format first (starts with { or [), return NULL on invalid JSON
         const jsonExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' AND (cat.${entry.source} LIKE '{%' OR cat.${entry.source} LIKE '[%') THEN COALESCE(cat.${entry.source}::jsonb->>'${entry.key}', NULL) ELSE NULL END`;
-        return {
-            target,
-            valueExpr: jsonExpr,
-            nullCheckExpr: `${jsonExpr} IS NOT NULL AND ${jsonExpr} != ''`,
-            isNumeric: false
-        };
+        return { target, valueExpr: jsonExpr, isNumeric: false };
     }
 
     if (entry.transform === 'text_to_jsonb') {
         if (!catalogTypes.has(entry.source)) return null;
-        const jsonbExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' THEN cat.${entry.source}::jsonb ELSE NULL END`;
+        // Validate before casting (empty/malformed text would abort the whole
+        // batch UPDATE otherwise). isJsonb tells the diff/write logic to
+        // compare and assign at the jsonb level instead of via ::text — jsonb
+        // equality is structural, so it isn't tripped up by whitespace/key-
+        // order differences between the target's stored jsonb and the raw
+        // catalog text (which a plain ::text comparison would flag as
+        // different on nearly every row, even when the content is identical).
+        // pg_input_is_valid (PG 17+) checks validity without raising, unlike a
+        // plain ::jsonb cast — real catalog text can be malformed JSON (e.g.
+        // an unescaped " inside a value like 5/8" wide breaks the string
+        // literal), which would otherwise abort the whole batch UPDATE.
+        const jsonbExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' AND pg_input_is_valid(cat.${entry.source}, 'jsonb') THEN cat.${entry.source}::jsonb ELSE NULL END`;
         return {
             target,
             valueExpr: jsonbExpr,
-            nullCheckExpr: `${jsonbExpr} IS NOT NULL`,
-            isNumeric: false
+            isNumeric: false,
+            isJsonb: true
         };
     }
 
@@ -376,9 +382,15 @@ export async function updateMatchWithCatalog(targetTable, catalog_base_partition
         // so a plain ::float8 cast on mss.${spec.target} would hit "operator
         // does not exist: text = double precision". safeNumericExpr casts
         // both sides explicitly regardless of the target column's actual type.
-        const matchDiffCondition = spec.isNumeric
-            ? `${safeNumericExpr(`mss.${spec.target}`)} IS DISTINCT FROM ${safeNumericExpr('res.sync_value')}`
-            : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
+        // isJsonb compares/assigns at the jsonb level directly — a ::text
+        // comparison would flag nearly every row as "different" since jsonb's
+        // canonical text serialization rarely matches the raw catalog string
+        // byte-for-byte even when the content is identical.
+        const matchDiffCondition = spec.isJsonb
+            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value`
+            : spec.isNumeric
+                ? `${safeNumericExpr(`mss.${spec.target}`)} IS DISTINCT FROM ${safeNumericExpr('res.sync_value')}`
+                : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
 
         let query = `
         WITH filtered_catalog AS (
@@ -394,7 +406,7 @@ export async function updateMatchWithCatalog(targetTable, catalog_base_partition
                 ${catalogActiveOnly ? ` AND cat.is_active` : ''}
         )
         UPDATE ${targetTable} mss
-        SET ${spec.target} = ${spec.target === 'base_custom_attributes' ? 'res.sync_value::jsonb' : 'res.sync_value'}
+        SET ${spec.target} = res.sync_value
             , internal_notes = 'match_update_by_catalog_processor: ${current_time}'
         FROM filtered_catalog res
         WHERE mss.base_sku = res.sku
@@ -421,15 +433,11 @@ export async function fetchMatchDifferentWithCatalog(targetTable, catalog_base_p
         const { catalogActiveOnly = false } = options;
 
         // Null-safe on purpose — see updateMatchWithCatalog's matchDiffCondition.
-        // Cast to text before LOWER() to handle jsonb columns (text::text is no-op).
-        // isNumeric reflects the CATALOG source column's type, not the target
-        // column's — e.g. base_total_size is text in matches but numeric here,
-        // so a plain ::float8 cast on mss.${spec.target} would hit "operator
-        // does not exist: text = double precision". safeNumericExpr casts
-        // both sides explicitly regardless of the target column's actual type.
-        const matchDiffCondition = spec.isNumeric
-            ? `${safeNumericExpr(`mss.${spec.target}`)} IS DISTINCT FROM ${safeNumericExpr('res.sync_value')}`
-            : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
+        const matchDiffCondition = spec.isJsonb
+            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value`
+            : spec.isNumeric
+                ? `${safeNumericExpr(`mss.${spec.target}`)} IS DISTINCT FROM ${safeNumericExpr('res.sync_value')}`
+                : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
 
         let query = `
         WITH filtered_catalog AS (
@@ -477,8 +485,8 @@ export async function fetchMatchDifferentWithCatalog(targetTable, catalog_base_p
             mss.match,
             mss.model_used,
             '${spec.target} is not matching' as update_reason,
-            mss.${spec.target} as old_value,
-            res.sync_value as updated_value
+            mss.${spec.target}::text as old_value,
+            res.sync_value::text as updated_value
             FROM ${targetTable} mss
             INNER JOIN filtered_catalog res ON mss.base_sku = res.sku
             WHERE

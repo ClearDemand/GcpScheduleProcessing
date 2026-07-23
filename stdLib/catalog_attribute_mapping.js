@@ -16,6 +16,12 @@
 //    fallback                     applied when every source is falsy
 //    prefix                       prepend literal `prefix` to `source`
 //    json_extract                 pull `key` out of the JSON `source` column
+//    text_to_jsonb                validate + cast `source` to jsonb wholesale
+//                                 (for a jsonb target column) — compared and
+//                                 assigned at the jsonb level, not via ::text,
+//                                 so whitespace/key-order differences between
+//                                 the stored value and the raw catalog text
+//                                 don't register as false discrepancies
 //    first_number                 the first number found anywhere in the text
 //                                 (e.g. "Case of 24" -> 24, "39ML" -> 39);
 //                                 falls back to the first token when there's
@@ -41,6 +47,7 @@ export const DEFAULT_CATALOG_ATTRIBUTE_MAPPING = {
 
     base_custom_attributes: {
         source: 'additional_attributes',
+        transform: 'text_to_jsonb',
         enabled_by_flag: 'allowAdditionalAttribute',
         default: null
     },
