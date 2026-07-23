@@ -36,6 +36,15 @@ export default {
         memory: '8Gi',
         env: {}
     },
+    'catalog-sync': {
+        handlerPath: './jobs/catalog_sync.js',
+        // Everyday at 06:30 IST (= 01:00 UTC), matching the PmtScheduleProcessing
+        schedule: '30 6 * * *',
+        timezone: 'Asia/Kolkata',
+        timeout: '3600s',
+        memory: '4Gi',
+        env: {}
+    },
     'match-update-processor': {
         handlerPath: './jobs/match_update_processor.js',
         // No schedule — triggered on demand (via the Cloud Run Admin API's
