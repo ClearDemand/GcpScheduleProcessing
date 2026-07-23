@@ -16,21 +16,38 @@
 //    fallback                     applied when every source is falsy
 //    prefix                       prepend literal `prefix` to `source`
 //    json_extract                 pull `key` out of the JSON `source` column
-//    first_token                  String(value).split(' ')[0]
+//    text_to_jsonb                validate + cast `source` to jsonb wholesale
+//                                 (for a jsonb target column) — compared and
+//                                 assigned at the jsonb level, not via ::text,
+//                                 so whitespace/key-order differences between
+//                                 the stored value and the raw catalog text
+//                                 don't register as false discrepancies
+//    first_number                 the first number found anywhere in the text
+//                                 (e.g. "Case of 24" -> 24, "39ML" -> 39);
+//                                 falls back to the first token when there's
+//                                 no number at all (e.g. "Tablet" stays as-is)
 //    variants                     first entry whose flag is enabled; a flagless
 //                                 entry is the default
-//    recompute_total_size         when this column syncs, also recompute
-//                                 base_total_size = size * pack_size (no
-//                                 standalone base_total_size mapping entry)
+//
+//  base_total_size isn't a mapping entry at all — buildCatalogSyncPlan gives
+//  it its own independent spec, compared directly against what's stored so it
+//  self-heals regardless of whether base_size/base_pack_size changed (a row
+//  whose base_size/base_pack_size already matched the catalog would otherwise
+//  never re-trigger a recompute, leaving a wrong/null base_total_size stuck).
+//  Its value depends on the tenant, reproducing the original processor:
+//  tenants flagged total_size_from_size_and_pack (was company_code=='thrive')
+//  get size * pack-size-quantity; everyone else copies the catalog's own
+//  total_size column.
 // ----------------------------------------------------------------------------
 export const DEFAULT_CATALOG_ATTRIBUTE_MAPPING = {
     base_upc:              { sources: ['upc'] },
     base_parent_sku:       { sources: ['parent_sku'], default: null },
     base_sku:              { sources: ['sku'] },
-    base_custom_sku:       { sources: ['custom_sku', 'sku'] },
+    base_custom_sku:       { sources: ['custom_sku'] },
 
     base_custom_attributes: {
         source: 'additional_attributes',
+        transform: 'text_to_jsonb',
         enabled_by_flag: 'allowAdditionalAttribute',
         default: null
     },
@@ -55,11 +72,7 @@ export const DEFAULT_CATALOG_ATTRIBUTE_MAPPING = {
         enabled_by_flag: 'json_category_override_enabled'
     },
 
-    // recompute_total_size: base_total_size = size * pack_size is recomputed
-    // whenever either of these two columns syncs (buildCatalogSyncPlan), for
-    // every tenant whose catalog has both size and pack_size columns — no
-    // standalone base_total_size mapping entry is needed.
-    base_size:             { sources: ['size', 'product_weight_size'], default: null, recompute_total_size: true },
+    base_size:             { sources: ['size', 'product_weight_size'], default: null },
     base_uom:              { sources: ['uom', 'product_weight_uom'], default: null },
     base_shipping_weight:  { sources: ['shipping_weight'] },
     base_dimensions:       { sources: ['dimension', 'dimensions'] },
@@ -74,9 +87,8 @@ export const DEFAULT_CATALOG_ATTRIBUTE_MAPPING = {
 
     base_pack_size: {
         source: 'pack_size',
-        transform: 'first_token',
+        transform: 'first_number',
         coalesce: 'non_empty_string',
-        default: null,
-        recompute_total_size: true
+        default: null
     }
 };

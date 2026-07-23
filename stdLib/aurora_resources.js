@@ -161,6 +161,18 @@ const NUMERIC_DATA_TYPES = new Set(['numeric', 'integer', 'bigint', 'smallint', 
 // catalog values onto existing matches; it never builds new rows).
 const SYNC_UNSUPPORTED_TRANSFORMS = new Set(['json_to_string', 'json_extract_base_upc', 'prefix']);
 
+// Strips non-digit/non-decimal characters before casting to numeric, so a
+// stray unit suffix (e.g. "39ML") or a completely non-numeric value (e.g.
+// "Tablet") can't abort a whole batch UPDATE — a value with nothing numeric
+// left becomes NULL (skipped) instead of erroring.
+const safeNumericExpr = expr => `NULLIF(regexp_replace((${expr})::text, '[^0-9.]', '', 'g'), '')::numeric`;
+
+// The meaningful number in a pack-size-style value can appear anywhere in the
+// text, not just as the first space-separated token — e.g. "Case of 24" is
+// 24, "39ML" is 39. Search the whole string for the first number instead of
+// assuming a fixed position.
+const firstNumberExpr = expr => `substring((${expr})::text from '[0-9]+\\.?[0-9]*')`;
+
 // Drops mapping entries whose `enabled_by_flag` is off on this tenant's company-code doc.
 function resolveMappingEntry(entry, client) {
     if (entry.enabled_by_flag && !client[entry.enabled_by_flag]) return null;
@@ -175,26 +187,32 @@ function buildColumnSpec(target, entry, catalogTypes) {
         if (!catalogTypes.has(entry.source)) return null;
         // Safely extract from JSON: validate format first (starts with { or [), return NULL on invalid JSON
         const jsonExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' AND (cat.${entry.source} LIKE '{%' OR cat.${entry.source} LIKE '[%') THEN COALESCE(cat.${entry.source}::jsonb->>'${entry.key}', NULL) ELSE NULL END`;
-        return {
-            target,
-            valueExpr: jsonExpr,
-            nullCheckExpr: `${jsonExpr} IS NOT NULL AND ${jsonExpr} != ''`,
-            isNumeric: false
-        };
+        return { target, valueExpr: jsonExpr, isNumeric: false };
     }
 
     if (entry.transform === 'text_to_jsonb') {
         if (!catalogTypes.has(entry.source)) return null;
-        const jsonbExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' THEN cat.${entry.source}::jsonb ELSE NULL END`;
+        // Validate before casting (empty/malformed text would abort the whole
+        // batch UPDATE otherwise). isJsonb tells the diff/write logic to
+        // compare and assign at the jsonb level instead of via ::text — jsonb
+        // equality is structural, so it isn't tripped up by whitespace/key-
+        // order differences between the target's stored jsonb and the raw
+        // catalog text (which a plain ::text comparison would flag as
+        // different on nearly every row, even when the content is identical).
+        // pg_input_is_valid (PG 17+) checks validity without raising, unlike a
+        // plain ::jsonb cast — real catalog text can be malformed JSON (e.g.
+        // an unescaped " inside a value like 5/8" wide breaks the string
+        // literal), which would otherwise abort the whole batch UPDATE.
+        const jsonbExpr = `CASE WHEN cat.${entry.source} IS NOT NULL AND cat.${entry.source} <> '' AND pg_input_is_valid(cat.${entry.source}, 'jsonb') THEN cat.${entry.source}::jsonb ELSE NULL END`;
         return {
             target,
             valueExpr: jsonbExpr,
-            nullCheckExpr: `${jsonbExpr} IS NOT NULL`,
-            isNumeric: false
+            isNumeric: false,
+            isJsonb: true
         };
     }
 
-    if (entry.transform && entry.transform !== 'first_token') {
+    if (entry.transform && entry.transform !== 'first_number') {
         const reason = SYNC_UNSUPPORTED_TRANSFORMS.has(entry.transform) ? 'ingestion-only' : 'unknown';
         console.log(`buildColumnSpec: ${target} uses ${reason} transform '${entry.transform}' - skipped`);
         return null;
@@ -214,7 +232,10 @@ function buildColumnSpec(target, entry, catalogTypes) {
         if (numericCol && !isNumeric) expr = `(${expr})::text`;
         // inside a coalesce chain '' must become NULL so the next source gets a chance
         if (!numericCol && multiSource) expr = `NULLIF(${expr}, '')`;
-        if (entry.transform === 'first_token') expr = `split_part(${expr}, ' ', 1)`;
+        // Prefer the number wherever it appears in the text (e.g. "Case of
+        // 24" -> 24); fall back to the first token when there's no number at
+        // all (e.g. "Tablet" stays "Tablet" rather than becoming blank).
+        if (entry.transform === 'first_number') expr = `COALESCE(${firstNumberExpr(expr)}, split_part(${expr}, ' ', 1))`;
         return expr;
     });
     const valueExpr = multiSource ? `COALESCE(${exprs.join(', ')})` : exprs[0];
@@ -239,12 +260,6 @@ export async function buildCatalogSyncPlan(catalogTable, targetTable, client) {
         const catalogTypes = new Map((await getSchema(catalogTable)).map(r => [r.column_name, r.data_type]));
         const targetCols = new Set((await getSchema(targetTable)).map(r => r.column_name));
 
-        // base_total_size = size * pack_size rides along on whichever of these
-        // two columns' own UPDATE pass runs (see recompute_total_size in the
-        // mapping doc) — only when this tenant's catalog has both source
-        // columns and the target table has base_total_size to write into.
-        const canRecomputeTotalSize = catalogTypes.has('size') && catalogTypes.has('pack_size') && targetCols.has('base_total_size');
-
         const plan = [];
         for (const [target, rawEntry] of Object.entries(mapping)) {
             const entry = resolveMappingEntry(rawEntry, client);
@@ -252,9 +267,32 @@ export async function buildCatalogSyncPlan(catalogTable, targetTable, client) {
 
             const spec = buildColumnSpec(target, entry, catalogTypes);
             if (!spec) continue;
-
-            if (entry.recompute_total_size && canRecomputeTotalSize) spec.recomputeTotalSize = true;
             plan.push(spec);
+        }
+
+        // base_total_size gets its OWN independent spec (not a mapping entry),
+        // compared directly against what's stored so it self-heals regardless of
+        // whether base_size/base_pack_size themselves changed. Two behaviours,
+        // reproducing the original catalog_sync_processor:
+        //   - tenants with total_size_from_size_and_pack (was: the hardcoded
+        //     company_code == 'thrive' branch): compute size * pack-quantity
+        //     (pack quantity extracted from anywhere in the raw pack_size text);
+        //   - everyone else: copy the catalog's own total_size column verbatim
+        //     ('' -> NULL), matching `catalogData.total_size` in the original.
+        if (targetCols.has('base_total_size')) {
+            if (client.total_size_from_size_and_pack && catalogTypes.has('size') && catalogTypes.has('pack_size')) {
+                plan.push({
+                    target: 'base_total_size',
+                    valueExpr: `${safeNumericExpr('cat.size')} * ${safeNumericExpr(firstNumberExpr('cat.pack_size'))}`,
+                    isNumeric: true
+                });
+            } else if (catalogTypes.has('total_size')) {
+                plan.push({
+                    target: 'base_total_size',
+                    valueExpr: `NULLIF(cat.total_size::text, '')`,
+                    isNumeric: false
+                });
+            }
         }
         return plan;
     } catch (error) {
@@ -335,27 +373,24 @@ export async function updateMatchWithCatalog(targetTable, catalog_base_partition
 
         const current_time = new Date().toISOString();
 
-        // multiply-variant base_total_size recompute rides along on the
-        // base_size / base_pack_size updates (see buildCatalogSyncPlan).
-        let totalSizeCondition = '';
-        let companionSelect = '';
-        if (spec.recomputeTotalSize) {
-            if (spec.target === 'base_pack_size') {
-                companionSelect = ', cat.size';
-                totalSizeCondition = ` ,base_total_size=(res.sync_value::numeric) * (res.size::numeric)`;
-            } else if (spec.target === 'base_size') {
-                companionSelect = `, split_part(cat.pack_size, ' ', 1 ) as pack_size`;
-                totalSizeCondition = ` ,base_total_size=(res.pack_size::numeric) * (res.sync_value::numeric)`;
-            }
-        }
-
         // Null-safe on purpose: a null/empty catalog value that differs from the
         // target IS a discrepancy and gets written (clearing the match attribute).
         // '' and NULL are treated as the same "empty" state to avoid churn.
         // Cast to text before LOWER() to handle jsonb columns (text::text is no-op).
-        const matchDiffCondition = spec.isNumeric
-            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value::float8`
-            : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
+        // isNumeric reflects the CATALOG source column's type, not the target
+        // column's — e.g. base_total_size is text in matches but numeric here,
+        // so a plain ::float8 cast on mss.${spec.target} would hit "operator
+        // does not exist: text = double precision". safeNumericExpr casts
+        // both sides explicitly regardless of the target column's actual type.
+        // isJsonb compares/assigns at the jsonb level directly — a ::text
+        // comparison would flag nearly every row as "different" since jsonb's
+        // canonical text serialization rarely matches the raw catalog string
+        // byte-for-byte even when the content is identical.
+        const matchDiffCondition = spec.isJsonb
+            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value`
+            : spec.isNumeric
+                ? `${safeNumericExpr(`mss.${spec.target}`)} IS DISTINCT FROM ${safeNumericExpr('res.sync_value')}`
+                : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
 
         let query = `
         WITH filtered_catalog AS (
@@ -363,7 +398,6 @@ export async function updateMatchWithCatalog(targetTable, catalog_base_partition
                 ${spec.valueExpr} as sync_value,
                 cat.sku,
                 cat.is_active
-                ${companionSelect}
             FROM
                 ${catalog_base_partition} cat
             WHERE
@@ -372,8 +406,7 @@ export async function updateMatchWithCatalog(targetTable, catalog_base_partition
                 ${catalogActiveOnly ? ` AND cat.is_active` : ''}
         )
         UPDATE ${targetTable} mss
-        SET ${spec.target} = ${spec.target === 'base_custom_attributes' ? 'res.sync_value::jsonb' : 'res.sync_value'}
-        ${totalSizeCondition}
+        SET ${spec.target} = res.sync_value
             , internal_notes = 'match_update_by_catalog_processor: ${current_time}'
         FROM filtered_catalog res
         WHERE mss.base_sku = res.sku
@@ -400,10 +433,11 @@ export async function fetchMatchDifferentWithCatalog(targetTable, catalog_base_p
         const { catalogActiveOnly = false } = options;
 
         // Null-safe on purpose — see updateMatchWithCatalog's matchDiffCondition.
-        // Cast to text before LOWER() to handle jsonb columns (text::text is no-op).
-        const matchDiffCondition = spec.isNumeric
-            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value::float8`
-            : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
+        const matchDiffCondition = spec.isJsonb
+            ? `mss.${spec.target} IS DISTINCT FROM res.sync_value`
+            : spec.isNumeric
+                ? `${safeNumericExpr(`mss.${spec.target}`)} IS DISTINCT FROM ${safeNumericExpr('res.sync_value')}`
+                : `NULLIF(LOWER(mss.${spec.target}::text), '') IS DISTINCT FROM NULLIF(lower(res.sync_value::text), '')`;
 
         let query = `
         WITH filtered_catalog AS (
@@ -451,7 +485,8 @@ export async function fetchMatchDifferentWithCatalog(targetTable, catalog_base_p
             mss.match,
             mss.model_used,
             '${spec.target} is not matching' as update_reason,
-            res.sync_value as updated_value
+            mss.${spec.target}::text as old_value,
+            res.sync_value::text as updated_value
             FROM ${targetTable} mss
             INNER JOIN filtered_catalog res ON mss.base_sku = res.sku
             WHERE

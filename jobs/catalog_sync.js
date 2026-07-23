@@ -221,7 +221,7 @@ async function syncCatalogColumns({ table, catalogPartition, maxCatalogDate, pla
             match_id: row.match_id,
             base_sku: row.base_sku,
             column: spec.target,
-            old_value: row[spec.target] || null,
+            old_value: row.old_value ?? null,
             new_value: row.updated_value,
             comp_source_store: row.comp_source_store
         });
